@@ -1,4 +1,3 @@
-mod common;
 use std::{
     process::{Command, Stdio},
     time::Duration,
@@ -16,7 +15,6 @@ impl Drop for Hub {
 #[test]
 fn example_configuration_runs_a_hub_and_agent() {
     let dir = tempfile::tempdir().unwrap();
-    let key = common::key_file(dir.path());
     let database = dir.path().join("state.sqlite");
     let hub_file = dir.path().join("hub.toml");
     let agent_file = dir.path().join("agent.toml");
@@ -26,29 +24,40 @@ fn example_configuration_runs_a_hub_and_agent() {
     let offset = telegraff::utils::unix_time() % 3600;
     let source = include_str!("../examples/hub.toml");
     let ntfy_start = source.find("[ntfy]").unwrap();
-    let agents_start = source.find("[[agents]]").unwrap();
-    let hub = format!("{}{}", &source[..ntfy_start], &source[agents_start..]);
-    let hub = hub
+    let hub = source[..ntfy_start]
         .replace(
             "/var/lib/telegraff/state.sqlite",
             database.to_str().unwrap(),
         )
-        .replace("/etc/telegraff/node-01.key", key.to_str().unwrap())
         .replace("hub.example.net", "127.0.0.1")
         .replace(
             "[\"0.0.0.0:9477\", \"[::]:9477\"]",
             &format!("[\"127.0.0.1:{port}\"]"),
-        )
-        .replace("offset = 0", &format!("offset = {offset}"))
-        .replace("families = [\"ipv4\", \"ipv6\"]", "auto = true");
-    let agent = include_str!("../examples/agent.toml")
-        .replace("hub.example.net", "127.0.0.1")
-        .replace("port = 9477", &format!("port = {port}"))
-        .replace("offset = 0", &format!("offset = {offset}"))
-        .replace("families = [\"ipv4\", \"ipv6\"]", "auto = true")
-        .replace("/etc/telegraff/node-01.key", key.to_str().unwrap());
+        );
     std::fs::write(&hub_file, hub).unwrap();
-    std::fs::write(&agent_file, agent).unwrap();
+    let register = || {
+        Command::new(BIN)
+            .args(["register", "node-01", "--config"])
+            .arg(&hub_file)
+            .args(["--offset", &offset.to_string()])
+            .output()
+            .unwrap()
+    };
+    let first = register();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let profile = database
+        .with_added_extension("agents.d")
+        .join("node-01.profile");
+    std::fs::copy(&profile, &agent_file).unwrap();
+    assert!(!register().status.success());
+    assert_eq!(
+        std::fs::read(&profile).unwrap(),
+        std::fs::read(&agent_file).unwrap()
+    );
     for config in [&hub_file, &agent_file] {
         assert!(
             Command::new(BIN)

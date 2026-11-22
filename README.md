@@ -28,23 +28,17 @@ SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
 
 ## Configure the hub
 
-1. Copy the example configuration and create one key per agent:
+1. Install the hub configuration:
 
    ```sh
    sudo install -m 0640 -o root -g telegraff examples/hub.toml /etc/telegraff/hub.toml
-   sudo telegraff key generate --output /etc/telegraff/node-01.key
-   sudo chown telegraff:telegraff /etc/telegraff/node-01.key
    ```
 
-2. Edit `/etc/telegraff/hub.toml`. Replace `hub.example.net` with the hub DNS name or IP literal. Set `target` to the address agents use. Set the ntfy HTTPS topic URL. Save the ntfy bearer token in `/etc/telegraff/ntfy.token`, owned by `telegraff`, mode `0600`. Do not put it in a command argument. Subscribe to that topic in ntfy. For a local trial without notifications, remove the `[ntfy]` table.
+2. Edit `/etc/telegraff/hub.toml`. Replace `hub.example.net` with the hub DNS name or IP literal. Set `target` to the address agents use. Set `ntfy.endpoint` to the HTTPS topic URL and subscribe to that topic in ntfy. The URL is sufficient for topics that allow anonymous publishing. For a topic that requires authentication, uncomment `token_file` and save the ntfy access token in that file (owner `telegraff`, mode `0600`). For a local trial without notifications, remove the `[ntfy]` table.
 
-3. Add one `[[agents]]` entry per server. Use a unique name and key. Set `activation` to the Unix timestamp from which monitoring must start; `0` starts at the next observed scheduled deadline. Set `families = ["ipv4"]` for an IPv4-only endpoint, `["ipv6"]` for IPv6-only, or both for dual stack. These are required channels. A missing local route counts as a failure.
+3. Allow inbound TCP **and** UDP port `9477` in the host and provider firewalls for each configured address family. Agents need outbound access to that port. The hub needs DNS and HTTPS access to ntfy. Remove IPv6 listener entries only if the hub has no IPv6 support.
 
-4. To enroll families from DNS once, replace `families` with `auto = true`. The hub freezes the first nonempty DNS family set in SQLite. Later DNS changes appear in status. To change an enrolled set, use explicit `families` and restart. Prefer explicit families when agent and hub DNS views differ. The agent always tests every family currently advertised by DNS, including families beyond its expected set.
-
-5. Allow inbound TCP **and** UDP port `9477` in the host and provider firewalls for each configured address family. Agents need outbound access to that port. The hub needs DNS and HTTPS access to ntfy. Remove IPv6 listener entries only if the hub has no IPv6 support.
-
-6. Start the hub:
+4. Start the hub:
 
    ```sh
    sudo install -m 0644 packaging/telegraff-hub.service /etc/systemd/system/
@@ -55,16 +49,23 @@ SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
 
 ## Configure an agent
 
-1. Transfer only this agent's key to `/etc/telegraff/node-01.key` on the agent through an authenticated channel. Set owner `telegraff:telegraff` and mode `0600`.
-
-2. Install and edit its configuration:
+1. On the hub, register the agent and load its registration:
 
    ```sh
-   sudo install -m 0640 -o root -g telegraff examples/agent.toml /etc/telegraff/agent.toml
+   sudo -u telegraff telegraff register node-01
+   sudo systemctl restart telegraff-hub
+   ```
+
+   The command prints the path to a private profile. It uses the configured hub address, the first TCP listener's port, and the hourly timer. Use `--port` for port forwarding. Both transports must reach the hub on the advertised port. Each name has its own secret. Keep the hub's copy for future restarts.
+
+2. Transfer the profile over SSH to a private directory on the agent. Install it as the agent configuration:
+
+   ```sh
+   sudo install -o telegraff -g telegraff -m 0600 node-01.profile /etc/telegraff/agent.toml
    sudo -u telegraff telegraff config check --config /etc/telegraff/agent.toml
    ```
 
-   Set `hub` to the hub DNS name or an unbracketed IP literal. Set `port` separately. Match `name`, `activation`, `interval`, `offset`, `grace`, `families`, `payload_bytes`, and `udp_threshold` with the hub entry. Each transfer is 150 KiB by default; each cycle sends three per protocol and family. A dual-stack cycle sends 1800 KiB of payload.
+   The hub enrolls address families from DNS. TCP and UDP each send three transfers of 150 KiB per family. To revoke a registration, remove its profile from the hub registry and restart the hub.
 
 3. Install the service and timer:
 
@@ -74,7 +75,7 @@ SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
    sudo systemctl enable --now telegraff-agent.timer
    ```
 
-   The supplied timer matches `interval = 3600`, `offset = 0`. For another offset, change both configurations and the timer. For example, offset `300` requires minute `05` instead of `00`. Do not enable persistent catch-up or random delays.
+   The supplied timer matches `interval = 3600`, `offset = 0`. To run at five minutes past the hour, register with `--offset 300` and set the timer minute to `05`. Do not enable persistent catch-up or random delays.
 
 ## Verify operation
 
@@ -100,7 +101,7 @@ SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
 
 ## Maintenance and faults
 
-Set `paused = true` in the hub registry and restart the hub before maintenance. Set it to `false` and restart to resume without counting the maintenance backlog. Configuration changes require a restart. Keep the SQLite file and its WAL files together during backup; use SQLite online backup for a running hub.
+For an explicit `[[agents]]` entry, set `paused = true` and restart the hub before maintenance. Set it to `false` and restart to resume without counting the maintenance backlog. Configuration changes require a restart. Keep the SQLite file and its WAL files together during backup; use SQLite online backup for a running hub.
 
 | Condition | Action |
 |---|---|
@@ -111,7 +112,7 @@ Set `paused = true` in the hub registry and restart the hub before maintenance. 
 | Notification queued | Check ntfy URL, token, network access, and service logs. |
 | DNS family warning | Compare advertised and expected families; edit the registry if intentional. |
 
-Payloads are generated bytes. Authentication does not encrypt them. Logs and status contain technical names and aggregate results. The hub retains transfer summaries for 30 days and records observation gaps after downtime. It cannot alert while stopped: monitor its service or heartbeat from an independent system.
+Version 0.2 encrypts TCP and UDP frames with XChaCha20-Poly1305. The agent sends its token inside each encrypted request. The hub verifies the token before accepting data. The routing name is visible on the wire. Upgrade the hub and all agents together. Existing explicit registry entries and key files work with the new binaries. Logs and status contain technical names and aggregate results. The hub retains transfer summaries for 30 days and records observation gaps after downtime. It cannot alert while stopped: monitor its service or heartbeat from an independent system.
 
 ## Development
 
@@ -121,4 +122,4 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
-See [SPEC.md](SPEC.md) for requirements. Network tests require IPv4 and IPv6 loopback.
+Network tests require IPv4 and IPv6 loopback.

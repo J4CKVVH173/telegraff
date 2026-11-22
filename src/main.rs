@@ -13,6 +13,16 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Register a server and create its private agent profile.
+    Register {
+        name: String,
+        #[arg(long, default_value = "/etc/telegraff/hub.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+    },
     Hub {
         #[arg(long)]
         config: PathBuf,
@@ -60,6 +70,22 @@ async fn main() {
 }
 async fn execute(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Register {
+            name,
+            config,
+            port,
+            offset,
+        } => {
+            let Config::Hub(hub) = Config::load(&config)? else {
+                anyhow::bail!("Hub configuration required")
+            };
+            let path =
+                telegraff::infrastructure::registration::register(&hub, &name, port, offset)?;
+            println!(
+                "Registered {name}. Copy {} to the agent as /etc/telegraff/agent.toml (mode 0600). Restart the hub to load this registration.",
+                path.display()
+            );
+        }
         Command::Hub { config } => {
             let Config::Hub(config) = Config::load(&config)? else {
                 anyhow::bail!("Hub configuration required")

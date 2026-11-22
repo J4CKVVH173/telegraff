@@ -4,6 +4,7 @@ pub mod dns;
 pub mod hub;
 pub mod notification;
 pub mod receiver;
+pub mod registration;
 pub mod store;
 pub mod wire;
 

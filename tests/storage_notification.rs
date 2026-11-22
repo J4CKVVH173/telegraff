@@ -27,11 +27,20 @@ async fn ntfy_retries_in_order_against_local_stub() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/topic", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        for status in ["503 Service Unavailable", "200 OK", "200 OK"] {
+        for (status, authenticated) in [
+            ("200 OK", false),
+            ("503 Service Unavailable", true),
+            ("200 OK", true),
+            ("200 OK", true),
+        ] {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = [0; 4096];
             let n = socket.read(&mut buffer).await.unwrap();
-            assert!(n > 0);
+            let headers = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+            assert_eq!(
+                headers.contains("\r\nauthorization: bearer "),
+                authenticated
+            );
             socket
                 .write_all(
                     format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -42,10 +51,17 @@ async fn ntfy_retries_in_order_against_local_stub() {
         }
     });
     let dir = tempfile::tempdir().unwrap();
+    use telegraff::{application::ports::Notifier, infrastructure::config::NtfyConfig};
+    let public = Ntfy::new(&NtfyConfig {
+        endpoint: endpoint.clone(),
+        token_file: None,
+    })
+    .unwrap();
+    public.publish("public topic").await.unwrap();
     let token = common::key_file(dir.path());
     let notifier = Ntfy::new(&telegraff::infrastructure::config::NtfyConfig {
         endpoint,
-        token_file: token,
+        token_file: Some(token),
     })
     .unwrap();
     let mut state = State::default();

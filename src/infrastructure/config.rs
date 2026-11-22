@@ -62,6 +62,17 @@ pub struct AgentEntry {
     #[serde(default = "threshold")]
     pub udp_threshold: u8,
 }
+pub(super) fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 32
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
+        "Agent names must contain 1..32 ASCII letters, digits, hyphens or underscores"
+    );
+    Ok(())
+}
 impl AgentEntry {
     pub fn policy(&self) -> Policy {
         Policy {
@@ -77,15 +88,7 @@ impl AgentEntry {
         }
     }
     fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.name.is_empty()
-                && self.name.len() <= 32
-                && self
-                    .name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
-            "Agent names must contain 1..32 ASCII letters, digits, hyphens or underscores"
-        );
+        validate_name(&self.name)?;
         ensure!(
             self.activation <= 253402300799,
             "Activation timestamp is out of range"
@@ -123,7 +126,7 @@ impl AgentEntry {
 #[serde(deny_unknown_fields)]
 pub struct NtfyConfig {
     pub endpoint: String,
-    pub token_file: PathBuf,
+    pub token_file: Option<PathBuf>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +144,7 @@ pub struct HubConfig {
     #[serde(default = "assemblies")]
     pub max_assemblies: usize,
     pub ntfy: Option<NtfyConfig>,
+    #[serde(default)]
     pub agents: Vec<AgentEntry>,
 }
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +158,35 @@ pub struct AgentConfig {
     pub udp_bytes_per_second: u64,
     pub agent: AgentEntry,
 }
+impl AgentConfig {
+    pub(super) fn registered(
+        name: String,
+        key_file: PathBuf,
+        hub: String,
+        port: u16,
+        offset: u64,
+    ) -> Self {
+        Self {
+            hub,
+            port,
+            timeout_seconds: cycle_timeout(),
+            udp_bytes_per_second: rate(),
+            agent: AgentEntry {
+                name,
+                key_file,
+                activation: 0,
+                interval: interval(),
+                offset,
+                grace: grace(),
+                paused: false,
+                families: Vec::new(),
+                auto: true,
+                payload_bytes: payload(),
+                udp_threshold: threshold(),
+            },
+        }
+    }
+}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Config {
@@ -164,18 +197,25 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).context("Cannot read configuration file")?;
         // Parser diagnostics can quote input lines, including credentials.
-        let config: Self = toml::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("Invalid TOML configuration or unknown field"))?;
+        let mut config: Self = match toml::from_str(&text) {
+            Ok(config) => config,
+            Err(_) => {
+                let profile: super::registration::Profile = toml::from_str(&text)
+                    .map_err(|_| anyhow::anyhow!("Invalid TOML configuration or unknown field"))?;
+                check_permissions(path)?;
+                Config::Agent(profile.agent(path))
+            }
+        };
+        if let Self::Hub(hub) = &mut config {
+            super::registration::load_registry(hub)?;
+        }
         config.validate()?;
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Hub(c) => {
-                ensure!(
-                    !c.target.is_empty() && !c.agents.is_empty(),
-                    "Hub target and agent registry are required"
-                );
+                ensure!(!c.target.is_empty(), "Hub target is required");
                 ensure!(
                     !c.tcp_listen.is_empty() && !c.udp_listen.is_empty(),
                     "TCP and UDP listeners are required"
@@ -203,7 +243,9 @@ impl Config {
                             && url.fragment().is_none(),
                         "ntfy requires HTTPS without URL credentials or query"
                     );
-                    read_token(&n.token_file)?;
+                    if let Some(path) = &n.token_file {
+                        read_token(path)?;
+                    }
                 }
             }
             Self::Agent(c) => {
@@ -228,7 +270,17 @@ impl Config {
 pub fn read_key(path: &Path) -> Result<Vec<u8>> {
     check_permissions(path)?;
     let text = fs::read_to_string(path).context("Cannot read key file")?;
-    let key = hex::decode(text.trim()).context("Key must be hexadecimal")?;
+    let secret = if text.trim().len() == 64 {
+        text.trim()
+    } else {
+        let profile: super::registration::Profile =
+            toml::from_str(&text).map_err(|_| anyhow::anyhow!("Invalid credential file"))?;
+        return decode_key(&profile.secret);
+    };
+    decode_key(secret)
+}
+fn decode_key(secret: &str) -> Result<Vec<u8>> {
+    let key = hex::decode(secret).context("Key must be hexadecimal")?;
     ensure!(key.len() == 32, "Key must contain 32 bytes");
     Ok(key)
 }
@@ -241,7 +293,7 @@ pub fn read_token(path: &Path) -> Result<String> {
     );
     Ok(token.trim().into())
 }
-fn check_permissions(path: &Path) -> Result<()> {
+pub(super) fn check_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let metadata = fs::metadata(path).context("Cannot inspect secret file")?;
     ensure!(
