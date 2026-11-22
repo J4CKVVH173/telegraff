@@ -168,15 +168,18 @@ async fn execute(cli: Cli) -> Result<()> {
             };
             let settings = telegraff::application::agent::AgentSettings {
                 policy: config.agent.policy(),
-                hub: config.hub,
+                hub: config.hub.clone(),
                 port: config.port,
                 timeout_seconds: config.timeout_seconds,
                 auto: config.agent.auto,
             };
-            let mut transport = SocketTransport::new(
+            let mut transport = SocketTransport::for_hub(
                 telegraff::infrastructure::config::read_key(&config.agent.key_file)?,
                 config.udp_bytes_per_second,
-            );
+                &config.hub,
+                config.tls,
+                config.ca_file.as_deref(),
+            )?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             let resolver = Dns::new()?;

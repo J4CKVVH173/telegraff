@@ -26,6 +26,10 @@ pub(super) struct Profile {
     hub: String,
     port: u16,
     offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_file: Option<PathBuf>,
     #[serde(default = "continuous_default")]
     continuous: bool,
     pub(super) secret: String,
@@ -40,6 +44,8 @@ impl Profile {
             self.port,
             self.offset,
         );
+        config.tls = self.tls;
+        config.ca_file = self.ca_file.clone();
         if self.continuous {
             config.agent.grace = config.agent.interval;
         }
@@ -96,6 +102,8 @@ pub fn register(hub: &HubConfig, name: &str, port: Option<u16>, offset: u64) -> 
         port,
         offset,
         continuous: true,
+        tls: None,
+        ca_file: None,
         secret: hex::encode(rand::random::<[u8; 32]>()),
     };
     let mut file = tempfile::NamedTempFile::new_in(&dir)?;

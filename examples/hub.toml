@@ -1,7 +1,7 @@
 mode = "hub"
 database = "/var/lib/telegraff/state.sqlite"
 target = "hub.example.net"
-# Set to 443 when raw TCP and UDP are forwarded from 443 to the listeners.
+# Set to 443 when nginx serves HTTPS and UDP is separately forwarded on 443.
 # public_port = 443
 tcp_listen = ["0.0.0.0:9477", "[::]:9477"]
 udp_listen = ["0.0.0.0:9477", "[::]:9477"]

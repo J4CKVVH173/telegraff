@@ -1,0 +1,300 @@
+mod common;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+use telegraff::{
+    application::{
+        Channel, Family, Protocol,
+        ports::{IdentityRequest, Resolution, TransferRequest, Transport},
+    },
+    infrastructure::{
+        agent::SocketTransport,
+        receiver::{self, Intake},
+    },
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+    time::timeout,
+};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{self, pki_types::PrivatePkcs8KeyDer},
+};
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    ca: PathBuf,
+    address: SocketAddr,
+    backend: SocketAddr,
+    sni: mpsc::Receiver<String>,
+    intake: mpsc::Receiver<Intake>,
+    tasks: Vec<JoinHandle<()>>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+impl Fixture {
+    async fn new(ip: IpAddr) -> Self {
+        let certificate = rcgen::generate_simple_self_signed(vec!["hub.test".into()]).unwrap();
+        Self::with_certificate(ip, certificate).await
+    }
+    async fn with_certificate(ip: IpAddr, certificate: rcgen::CertifiedKey) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("test-ca.pem");
+        std::fs::write(&ca, certificate.cert.pem()).unwrap();
+        let key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.cert.der().clone()], key.into())
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Model nginx forwarding either public address family to an IPv4 backend.
+        let listener_backend = receiver::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let backend = listener_backend.local_addr().unwrap();
+        let mut entry = common::entry(common::key_file(dir.path()));
+        entry.grace = entry.interval;
+        let registry = receiver::registry(&[entry]).unwrap();
+        let (tx, intake) = mpsc::channel(32);
+        let hub = tokio::spawn(async move {
+            receiver::tcp_loop(listener_backend, registry, tx, Arc::new(Semaphore::new(8)))
+                .await
+                .unwrap();
+        });
+        let (sni_tx, sni) = mpsc::channel(32);
+        let proxy = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                // Tests use sequential requests; no detached per-request tasks remain.
+                if let Ok(mut tls) = acceptor.accept(socket).await {
+                    sni_tx
+                        .send(tls.get_ref().1.server_name().unwrap_or("").to_owned())
+                        .await
+                        .unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        assert!(headers.len() < 8192);
+                        headers.push(tls.read_u8().await.unwrap());
+                    }
+                    let text = std::str::from_utf8(&headers).unwrap().to_ascii_lowercase();
+                    assert!(text.starts_with("post /telegraff http/1.1\r\n"));
+                    assert!(text.contains(&format!("\r\nhost: hub.test:{}\r\n", address.port())));
+                    let mut upstream = TcpStream::connect(backend).await.unwrap();
+                    upstream.write_all(&headers).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await;
+                }
+            }
+        });
+        Self {
+            _dir: dir,
+            ca,
+            address,
+            backend,
+            sni,
+            intake,
+            tasks: vec![hub, proxy],
+        }
+    }
+    fn transport(&self, host: &str, trusted: bool) -> SocketTransport {
+        SocketTransport::for_hub(
+            vec![7; 32],
+            1048576,
+            host,
+            None,
+            if trusted {
+                Some(self.ca.as_path())
+            } else {
+                None
+            },
+        )
+        .unwrap()
+    }
+    fn request(&self) -> TransferRequest {
+        TransferRequest {
+            agent: "node-01".into(),
+            cycle: 123456,
+            channel: Channel {
+                family: if self.address.is_ipv4() {
+                    Family::Ipv4
+                } else {
+                    Family::Ipv6
+                },
+                protocol: Protocol::Tcp,
+            },
+            transfer: 0,
+            total: 153600,
+        }
+    }
+}
+async fn check_https(ip: IpAddr) {
+    let mut fixture = Fixture::new(ip).await;
+    let mut transport = fixture.transport("hub.test", true);
+    let address = fixture.address;
+    let request = fixture.request();
+    let family = request.channel.family;
+    let resolution = Resolution {
+        addresses: vec![ip],
+        ipv4_error: false,
+        ipv6_error: false,
+    };
+    let identify = transport.identify(IdentityRequest {
+        addresses: vec![address],
+        agent: "node-01".into(),
+        cycle: 123456,
+        total: 153600,
+        observation: resolution.observation(),
+    });
+    let respond = async {
+        let event = fixture.intake.recv().await.unwrap();
+        assert!(matches!(event.event, receiver::Incoming::Dns(_, _)));
+        event
+            .accepted
+            .send(receiver::IntakeReply {
+                accepted: true,
+                families: vec![family],
+            })
+            .unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(identify, respond)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Some(vec![family]));
+    let send = transport.send(address, request, Duration::from_secs(5));
+    let respond = async {
+        let event = fixture.intake.recv().await.unwrap();
+        let receiver::Incoming::Transfer(transfer) = event.event else {
+            panic!("transfer expected")
+        };
+        assert_eq!(transfer.channel.family, family);
+        assert_eq!(transfer.bytes, 153600);
+        event
+            .accepted
+            .send(receiver::IntakeReply {
+                accepted: true,
+                families: vec![family],
+            })
+            .unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(send, respond)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), 153600);
+    for _ in 0..2 {
+        assert_eq!(fixture.sni.recv().await.unwrap(), "hub.test");
+    }
+}
+#[tokio::test]
+async fn https_sni_and_receipts_over_ipv4() {
+    check_https("127.0.0.1".parse().unwrap()).await;
+}
+#[tokio::test]
+async fn https_ipv6_frontend_with_ipv4_backend() {
+    check_https("::1".parse().unwrap()).await;
+}
+#[tokio::test]
+async fn rejects_untrusted_certificate_without_plaintext_fallback() {
+    let mut fixture = Fixture::new("127.0.0.1".parse().unwrap()).await;
+    let mut transport = fixture.transport("hub.test", false);
+    let error = transport
+        .send(fixture.address, fixture.request(), Duration::from_secs(5))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("UnknownIssuer"), "{error}");
+    assert!(fixture.intake.try_recv().is_err());
+}
+#[tokio::test]
+async fn rejects_wrong_hostname_even_with_trusted_certificate() {
+    let mut fixture = Fixture::new("127.0.0.1".parse().unwrap()).await;
+    let mut transport = fixture.transport("wrong.test", true);
+    let error = transport
+        .send(fixture.address, fixture.request(), Duration::from_secs(5))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("certificate not valid for name"), "{error}");
+    assert!(fixture.intake.try_recv().is_err());
+}
+#[tokio::test]
+async fn explicit_plain_tcp_preserves_legacy_domain_connections() {
+    let mut fixture = Fixture::new("127.0.0.1".parse().unwrap()).await;
+    let mut transport =
+        SocketTransport::for_hub(vec![7; 32], 1048576, "hub.test", Some(false), None).unwrap();
+    let send = transport.send(fixture.backend, fixture.request(), Duration::from_secs(5));
+    let respond = async {
+        let event = fixture.intake.recv().await.unwrap();
+        event
+            .accepted
+            .send(receiver::IntakeReply {
+                accepted: true,
+                families: vec![Family::Ipv4],
+            })
+            .unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(send, respond)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), 153600);
+}
+#[test]
+fn rejects_invalid_ca_or_host_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_ca = dir.path().join("empty.pem");
+    std::fs::write(&empty_ca, "").unwrap();
+    assert!(
+        SocketTransport::for_hub(vec![7; 32], 1048576, "hub.test", None, Some(&empty_ca)).is_err()
+    );
+    assert!(
+        SocketTransport::for_hub(
+            vec![7; 32],
+            1048576,
+            "hub.test",
+            Some(false),
+            Some(&empty_ca)
+        )
+        .is_err()
+    );
+    assert!(
+        SocketTransport::for_hub(vec![7; 32], 1048576, "https://hub.test/path", None, None)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn rejects_expired_certificate_even_when_explicitly_trusted() {
+    let mut params = rcgen::CertificateParams::new(vec!["hub.test".into()]).unwrap();
+    params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+    let key_pair = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let mut fixture = Fixture::with_certificate(
+        "127.0.0.1".parse().unwrap(),
+        rcgen::CertifiedKey { cert, key_pair },
+    )
+    .await;
+    let mut transport = fixture.transport("hub.test", true);
+    let error = transport
+        .send(fixture.address, fixture.request(), Duration::from_secs(5))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("certificate expired"), "{error}");
+    assert!(fixture.intake.try_recv().is_err());
+}

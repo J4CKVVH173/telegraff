@@ -8,7 +8,7 @@ The hub sends an ntfy alert after three consecutive failed cycles for a channel.
 
 ## Requirements
 
-Use Linux and working DNS. systemd is optional; registered profiles do not require synchronized agent and hub clocks.
+Use Linux and working DNS. systemd is optional; monitoring does not require matching agent and hub clocks. HTTPS certificate validity still requires a reasonably accurate agent clock.
 Build with Rust 1.98.1, a C compiler, and the system development headers.
 On Debian or Ubuntu, install `build-essential` and `pkg-config`.
 SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
@@ -71,7 +71,26 @@ Agent foreground mode now stays running, checks access immediately, and repeats 
 
 Registered profiles run immediately without a scheduled window. The hub assigns incoming cycles to its own interval timeline, anchored when it first loads the registration; agent clocks do not have to match the hub clock. Cycle tokens and interval anchors are persisted, so a previously accepted token cannot count again in a later interval after restart. Upgrade and restart both hub and agent, including for existing profiles. Handwritten legacy `mode = "agent"` configurations retain their explicit scheduling policy; `grace = interval` selects continuous mode on both sides.
 
-For forwarding, set `public_port = 443` in the hub configuration while retaining local listeners on the desired internal port, or pass `register --port 443`. Both raw TCP and UDP must be forwarded. An HTTP/HTTPS reverse proxy and TLS termination are incompatible with this binary protocol; use TCP/UDP passthrough. The agent sends to the hub; it does not listen on a port. Hub startup checks public TCP connectivity; authentication and UDP are checked by the agent's first cycle.
+For forwarding, set `public_port = 443` in the hub configuration while retaining local listeners on the desired internal port, or pass `register --port 443`. DNS names automatically use HTTPS for TCP: the domain is sent in SNI and HTTP Host, and encrypted telegraff frames travel as `POST /telegraff`. The selected IPv4/IPv6 address is pinned for each attempt. IP literals keep raw TCP by default. Set `tls = false` in an agent profile only for an intentional direct raw TCP connection; TLS failures never fall back automatically. Upgrade the hub first because older hubs cannot read the HTTP envelope.
+
+The agent validates the certificate chain, domain and validity dates using bundled public roots and the system trust store. Existing nginx certificates for the domain work normally. For a private CA or deliberately self-signed certificate, add `ca_file = "/etc/telegraff/ca.pem"` to the agent profile; it must contain public PEM certificates, never the server private key. Name and date checks remain enabled. Certificate and connection errors appear in each failed TCP attempt in the JSON report. Certificate renewal belongs to nginx/ACME; telegraff does not issue certificates.
+
+nginx may terminate TLS and forward HTTP to the hub's existing TCP listener. For example, inside the HTTPS server block for the hub domain:
+
+```nginx
+location = /telegraff {
+    client_max_body_size 256k;
+    proxy_pass http://127.0.0.1:19477;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_request_buffering on;
+    proxy_read_timeout 15s;
+}
+```
+
+If a `stream` SNI router fronts nginx, route the hub domain to this HTTPS server, which then forwards `/telegraff` to the hub. Raw TLS passthrough directly to telegraff is insufficient: its internal listener expects HTTP or legacy raw frames, not TLS. Keep that backend private. The authenticated frame supplies the tested client address family even when nginx uses IPv4 for its upstream connection.
+
+UDP remains the existing encrypted datagram protocol: it is not HTTPS and has no TLS SNI. Forward public UDP separately (for example, nginx `stream` with `listen 443 udp` and `proxy_pass 127.0.0.1:19477`); an HTTP location cannot proxy it. Both transports still use the profile's advertised port. Hub startup checks public TCP connectivity only; authentication, HTTPS and UDP are checked by the agent's first cycle. The agent does not listen on an inbound port.
 
 ## Verify operation
 

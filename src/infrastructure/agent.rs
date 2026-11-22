@@ -6,7 +6,7 @@ use crate::application::{
     Protocol,
     ports::{IdentityRequest, TransferRequest, Transport},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
@@ -18,6 +18,7 @@ pub struct SocketTransport {
     key: Vec<u8>,
     rate: u64,
     next_send: Instant,
+    https: Option<Https>,
 }
 impl SocketTransport {
     pub fn new(key: Vec<u8>, rate: u64) -> Self {
@@ -25,8 +26,115 @@ impl SocketTransport {
             key,
             rate,
             next_send: Instant::now(),
+            https: None,
         }
     }
+    pub fn for_hub(
+        key: Vec<u8>,
+        rate: u64,
+        hub: &str,
+        tls: Option<bool>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        ensure!(
+            !hub.trim().is_empty() && !hub.contains(['/', '@', '?', '#']),
+            "Hub must be a DNS name or IP literal without a scheme or path"
+        );
+        let mut transport = Self::new(key, rate);
+        if tls.unwrap_or_else(|| hub.parse::<std::net::IpAddr>().is_err()) {
+            let mut url = reqwest::Url::parse("https://localhost/telegraff")?;
+            url.set_host(Some(hub)).context("Invalid hub hostname")?;
+            let certificates = if let Some(path) = ca_file {
+                let pem = std::fs::read(path).context("Cannot read TLS CA file")?;
+                let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+                    .context("Invalid TLS CA PEM bundle")?;
+                ensure!(
+                    !certificates.is_empty(),
+                    "TLS CA file contains no certificates"
+                );
+                certificates
+            } else {
+                Vec::new()
+            };
+            transport.https = Some(Https {
+                host: url.host_str().context("Hub hostname required")?.to_owned(),
+                certificates,
+            });
+        } else {
+            ensure!(ca_file.is_none(), "ca_file requires TLS");
+        }
+        Ok(transport)
+    }
+    async fn exchange(&self, address: SocketAddr, frame: &Frame) -> Result<Vec<u8>> {
+        if let Some(https) = &self.https {
+            https.exchange(address, &frame.encode(&self.key)).await
+        } else {
+            let mut socket = TcpStream::connect(address).await?;
+            write_frame(&mut socket, &frame.encode(&self.key)).await?;
+            read_frame(&mut socket).await
+        }
+    }
+}
+struct Https {
+    host: String,
+    certificates: Vec<reqwest::Certificate>,
+}
+impl Https {
+    async fn exchange(&self, address: SocketAddr, bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut url = reqwest::Url::parse("https://localhost/telegraff")?;
+        url.set_host(Some(&self.host))
+            .context("Invalid hub hostname")?;
+        url.set_port(Some(address.port()))
+            .map_err(|_| anyhow::anyhow!("Invalid HTTPS port"))?;
+        // Pin the exact family/address selected by the monitoring application;
+        // retain the DNS hostname in the URL for Host, SNI and certificate checks.
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .http1_only()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&self.host, &[address])
+            .timeout(Duration::from_secs(10));
+        for certificate in &self.certificates {
+            builder = builder.add_root_certificate(certificate.clone());
+        }
+        let mut response = builder
+            .build()?
+            .post(url)
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "HTTPS connection or certificate verification failed: {}",
+                    error_chain(&e)
+                )
+            })?;
+        ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "Unexpected HTTPS status: {}",
+            response.status()
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                body.len() + chunk.len() <= super::wire::MAX_FRAME,
+                "HTTPS receipt too large"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+}
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        messages.push(error.to_string());
+        source = error.source();
+    }
+    messages.join(": ")
 }
 #[async_trait]
 impl Transport for SocketTransport {
@@ -55,9 +163,8 @@ impl Transport for SocketTransport {
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_secs(2)),
                 async {
-                    let mut socket = TcpStream::connect(address).await?;
-                    write_frame(&mut socket, &frame.encode(&self.key)).await?;
-                    let response = Frame::decode(&read_frame(&mut socket).await?, &self.key)?;
+                    let response =
+                        Frame::decode(&self.exchange(address, &frame).await?, &self.key)?;
                     ensure!(frame.matches_receipt(&response), "Invalid identity receipt");
                     let families = response
                         .payload
@@ -112,7 +219,11 @@ impl Transport for SocketTransport {
         };
         timeout(budget.min(Duration::from_secs(cap)), async {
             match frame.channel.protocol {
-                Protocol::Tcp => tcp(address, &frame, &self.key).await,
+                Protocol::Tcp => {
+                    let receipt = Frame::decode(&self.exchange(address, &frame).await?, &self.key)?;
+                    ensure!(frame.matches_receipt(&receipt), "Invalid TCP receipt");
+                    Ok(receipt.total as usize)
+                }
                 Protocol::Udp => {
                     udp(address, &frame, &self.key, self.rate, &mut self.next_send).await
                 }
@@ -121,14 +232,6 @@ impl Transport for SocketTransport {
         .await
         .map_err(|_| anyhow::anyhow!("Transfer timed out"))?
     }
-}
-async fn tcp(address: SocketAddr, frame: &Frame, key: &[u8]) -> Result<usize> {
-    let mut socket = TcpStream::connect(address).await?;
-    write_frame(&mut socket, &frame.encode(key)).await?;
-    let bytes = read_frame(&mut socket).await?;
-    let receipt = Frame::decode(&bytes, key)?;
-    ensure!(frame.matches_receipt(&receipt), "Invalid TCP receipt");
-    Ok(receipt.total as usize)
 }
 async fn udp(
     address: SocketAddr,

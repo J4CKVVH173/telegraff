@@ -4,3 +4,6 @@
 # Copy node-01.toml to the agent (mode 0600), then:
 #   telegraff agent --config node-01.toml -d
 # This comment-only file is not a runnable configuration.
+# DNS names use HTTPS with SNI and certificate verification automatically.
+# Add ca_file = "/etc/telegraff/ca.pem" to the generated profile for a private CA.
+# Add tls = false only for an intentional legacy raw TCP connection.

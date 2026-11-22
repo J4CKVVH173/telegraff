@@ -152,6 +152,9 @@ pub struct HubConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
+    /// Defaults to HTTPS for DNS names and raw TCP for IP literals.
+    pub tls: Option<bool>,
+    pub ca_file: Option<PathBuf>,
     pub hub: String,
     pub port: u16,
     #[serde(default = "cycle_timeout")]
@@ -171,6 +174,8 @@ impl AgentConfig {
         Self {
             hub,
             port,
+            tls: None,
+            ca_file: None,
             timeout_seconds: cycle_timeout(),
             udp_bytes_per_second: rate(),
             agent: AgentEntry {
@@ -253,6 +258,13 @@ impl Config {
             }
             Self::Agent(c) => {
                 c.agent.validate()?;
+                super::agent::SocketTransport::for_hub(
+                    vec![0; 32],
+                    c.udp_bytes_per_second,
+                    &c.hub,
+                    c.tls,
+                    c.ca_file.as_deref(),
+                )?;
                 ensure!(
                     !c.hub.is_empty() && c.port > 0,
                     "Hub address and port are required"

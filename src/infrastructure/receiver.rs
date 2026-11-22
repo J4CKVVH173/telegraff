@@ -29,7 +29,7 @@ pub struct Intake {
     pub event: Incoming,
     pub accepted: oneshot::Sender<IntakeReply>,
 }
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct IntakeReply {
     pub accepted: bool,
     pub families: Vec<Family>,
@@ -113,6 +113,7 @@ fn authenticate(
     registry: &Registry,
     peer: SocketAddr,
     protocol: Protocol,
+    http: bool,
 ) -> Result<(Frame, Credential)> {
     let name = Frame::identity(bytes)?;
     let credential = registry
@@ -121,7 +122,9 @@ fn authenticate(
     let frame = Frame::decode(bytes, &credential.key)?;
     ensure!(
         (frame.kind == DATA || (frame.kind == super::wire::IDENTITY && protocol == Protocol::Tcp))
-            && frame.channel.family == family(peer.ip())
+            // HTTPS can terminate at an IPv4 proxy after an IPv6 client connection.
+            // The family inside the authenticated frame describes that client leg.
+            && (http || frame.channel.family == family(peer.ip()))
             && frame.channel.protocol == protocol,
         "Invalid channel"
     );
@@ -197,8 +200,8 @@ pub async fn tcp_loop(
             let _permit = permit;
             let _ = timeout(Duration::from_secs(10), async {
                 let start = Instant::now();
-                let bytes = read_frame(&mut stream).await?;
-                let (frame, c) = authenticate(&bytes, &registry, peer, Protocol::Tcp)?;
+                let (bytes, http) = super::http::read_request(&mut stream).await?;
+                let (frame, c) = authenticate(&bytes, &registry, peer, Protocol::Tcp, http)?;
                 if frame.kind == super::wire::IDENTITY {
                     ensure!(frame.payload.len() <= 512, "Invalid identity report");
                     let observation: crate::application::ports::DnsObservation =
@@ -224,7 +227,8 @@ pub async fn tcp_loop(
                             .iter()
                             .map(|f| if *f == Family::Ipv4 { 4 } else { 6 })
                             .collect();
-                        write_frame(&mut stream, &receipt.encode(&c.key)).await?;
+                        super::http::write_response(&mut stream, &receipt.encode(&c.key), http)
+                            .await?;
                     }
                     return Ok::<_, anyhow::Error>(());
                 }
@@ -244,9 +248,10 @@ pub async fn tcp_loop(
                 )
                 .await
                 {
-                    write_frame(
+                    super::http::write_response(
                         &mut stream,
                         &frame.receipt(frame.payload.len()).encode(&c.key),
+                        http,
                     )
                     .await?;
                 }
@@ -333,7 +338,7 @@ pub async fn udp_loop(
                 if packet_window.0.elapsed() >= Duration::from_secs(1) { packet_window = (Instant::now(),0); }
                 packet_window.1 += 1;
                 if n > 1232 || packet_window.1 > 50000 { continue; }
-                let Ok((frame,c)) = authenticate(&buffer[..n],&registry,peer,Protocol::Udp) else { continue; };
+                let Ok((frame,c)) = authenticate(&buffer[..n],&registry,peer,Protocol::Udp,false) else { continue; };
                 let quota_cycle = unix_time() / c.entry.interval;
                 let q = quota.entry(frame.agent.clone()).or_insert((quota_cycle,0));
                 if q.0 != quota_cycle { *q = (quota_cycle,0); }

@@ -13,7 +13,7 @@ hex = "0.4"
 hickory-resolver = "0.25"
 hmac = "0.12"
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,3 +23,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 toml = "0.9"
 
 tempfile = "3"
+
+httparse = "1"
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

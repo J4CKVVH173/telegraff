@@ -17,3 +17,5 @@ impl crate::application::ports::Clock for SystemClock {
 
 pub mod process;
 pub mod setup;
+
+mod http;

@@ -35,6 +35,8 @@ pub struct ChannelReport {
 }
 #[derive(Debug, Serialize)]
 pub struct Attempt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub transfer: u8,
     pub receipt_received: bool,
     pub accepted_bytes: usize,
@@ -164,6 +166,7 @@ pub async fn run(
         for transfer in 0..3 {
             let mut accepted_bytes = 0;
             let mut received = false;
+            let mut last_error = None;
             let transfer_deadline = Instant::now()
                 + channel_deadline.saturating_duration_since(Instant::now())
                     / u32::from(3 - transfer);
@@ -181,10 +184,16 @@ pub async fn run(
                     total: policy.payload_bytes,
                 };
                 let attempt = transport.send(*address, request, remaining).await;
-                if let Ok(bytes) = attempt {
-                    accepted_bytes = bytes;
-                    received = true;
-                    break;
+                match attempt {
+                    Ok(bytes) => {
+                        accepted_bytes = bytes;
+                        received = true;
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                    }
                 }
             }
             let passed = match protocol {
@@ -199,6 +208,7 @@ pub async fn run(
             result.receipt_received |= received && passed;
             result.accepted_bytes = result.accepted_bytes.max(accepted_bytes);
             result.transfers.push(Attempt {
+                error: last_error,
                 transfer,
                 receipt_received: received,
                 accepted_bytes,
