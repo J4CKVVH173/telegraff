@@ -9,27 +9,44 @@ use telegraff::infrastructure::{
 #[command(version, about = "Scheduled TCP and UDP delivery monitoring")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Interactive first-time configuration.
+    Setup,
+    /// Stop a background hub or agent using this configuration.
+    Down {
+        #[arg(long, default_value = "telegraff.toml")]
+        config: PathBuf,
+    },
     /// Register a server and create its private agent profile.
     Register {
         name: String,
-        #[arg(long, default_value = "/etc/telegraff/hub.toml")]
+        #[arg(long, default_value = "telegraff.toml")]
         config: PathBuf,
         #[arg(long)]
         port: Option<u16>,
         #[arg(long, default_value_t = 0)]
         offset: u64,
+        /// Write a ready-to-copy private agent configuration.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     Hub {
-        #[arg(long)]
+        #[arg(long, default_value = "telegraff.toml")]
         config: PathBuf,
+        #[arg(short = 'd', long)]
+        daemon: bool,
     },
     Agent {
-        #[arg(long)]
+        #[arg(long, default_value = "telegraff.toml")]
         config: PathBuf,
+        #[arg(short = 'd', long)]
+        daemon: bool,
+        /// Perform a single diagnostic cycle.
+        #[arg(long)]
+        once: bool,
     },
     Config {
         #[command(subcommand)]
@@ -69,30 +86,83 @@ async fn main() {
     }
 }
 async fn execute(cli: Cli) -> Result<()> {
-    match cli.command {
+    let command = match cli.command {
+        Some(command) => command,
+        None if std::path::Path::new("telegraff.toml").exists() => {
+            match Config::load(std::path::Path::new("telegraff.toml"))? {
+                Config::Hub(_) => Command::Hub {
+                    config: "telegraff.toml".into(),
+                    daemon: false,
+                },
+                Config::Agent(_) => Command::Agent {
+                    config: "telegraff.toml".into(),
+                    daemon: false,
+                    once: false,
+                },
+            }
+        }
+        None => Command::Setup,
+    };
+    match command {
+        Command::Setup => telegraff::infrastructure::setup::run()?,
+        Command::Down { config } => telegraff::infrastructure::process::down(&config)?,
         Command::Register {
             name,
             config,
             port,
             offset,
+            output,
         } => {
             let Config::Hub(hub) = Config::load(&config)? else {
                 anyhow::bail!("Hub configuration required")
             };
+            let output = Some(output.unwrap_or_else(|| PathBuf::from(format!("{name}.toml"))));
+            if let Some(ref output) = output {
+                ensure!(
+                    !output.exists(),
+                    "Output already exists; refusing to overwrite"
+                );
+            }
             let path =
                 telegraff::infrastructure::registration::register(&hub, &name, port, offset)?;
+            if let Some(output) = output {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&output)
+                    .context("Cannot create agent configuration; destination must not exist")?;
+                file.write_all(&std::fs::read(&path)?)?;
+                file.sync_all()?;
+                println!(
+                    "Ready-to-copy agent configuration: {} (contains secret; mode 0600)",
+                    output.display()
+                );
+            }
             println!(
                 "Registered {name}. Copy {} to the agent as /etc/telegraff/agent.toml (mode 0600). Restart the hub to load this registration.",
                 path.display()
             );
         }
-        Command::Hub { config } => {
+        Command::Hub { config, daemon } => {
+            if daemon {
+                return telegraff::infrastructure::process::start("hub", &config);
+            }
+            let _guard = telegraff::infrastructure::process::guard(&config)?;
             let Config::Hub(config) = Config::load(&config)? else {
                 anyhow::bail!("Hub configuration required")
             };
             hub::run(config, &Dns::new()?).await?;
         }
-        Command::Agent { config } => {
+        Command::Agent {
+            config,
+            daemon,
+            once,
+        } => {
+            if daemon {
+                return telegraff::infrastructure::process::start("agent", &config);
+            }
+            let _guard = telegraff::infrastructure::process::guard(&config)?;
             let Config::Agent(config) = Config::load(&config)? else {
                 anyhow::bail!("Agent configuration required")
             };
@@ -107,22 +177,52 @@ async fn execute(cli: Cli) -> Result<()> {
                 telegraff::infrastructure::config::read_key(&config.agent.key_file)?,
                 config.udp_bytes_per_second,
             );
-            let report = tokio::time::timeout(
-                std::time::Duration::from_secs(settings.timeout_seconds),
-                telegraff::application::agent::run(
-                    &settings,
-                    &Dns::new()?,
-                    &mut transport,
-                    &telegraff::infrastructure::SystemClock,
-                ),
-            )
-            .await
-            .context("Cycle deadline exceeded")??;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            ensure!(
-                report.successful(),
-                "One or more expected channels lack a successful receipt; hub intake may differ"
-            );
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let resolver = Dns::new()?;
+            loop {
+                let result = tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = terminate.recv() => break,
+                result = tokio::time::timeout(
+                    std::time::Duration::from_secs(settings.timeout_seconds),
+                    telegraff::application::agent::run(
+                        &settings,
+                        &resolver,
+                        &mut transport,
+                        &telegraff::infrastructure::SystemClock,
+                    ),
+                ) => result.context("Cycle deadline exceeded").and_then(|r| r),
+                };
+                let report = match result {
+                    Ok(report) => report,
+                    Err(e) if once => return Err(e),
+                    Err(e) => {
+                        eprintln!("Cycle failed: {e}; will retry after interval");
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(settings.policy.interval)) => continue,
+                            _ = tokio::signal::ctrl_c() => break,
+                            _ = terminate.recv() => break,
+                        }
+                    }
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if once {
+                    ensure!(
+                        report.successful(),
+                        "One or more expected channels lack a successful receipt; hub intake may differ"
+                    );
+                    break;
+                }
+                if !report.successful() {
+                    eprintln!("Access check failed for one or more channels; retry scheduled");
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(settings.policy.interval)) => {},
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = terminate.recv() => break,
+                }
+            }
         }
         Command::Config {
             command: ConfigCommand::Check { config },

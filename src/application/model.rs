@@ -150,6 +150,10 @@ pub struct State {
     pub transfers: Vec<Transfer>,
     pub outbox: Vec<Notification>,
     pub next_notification: u64,
+    #[serde(default)]
+    pub cycle_anchors: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub cycle_tokens: BTreeMap<String, BTreeMap<u64, u64>>,
     pub observed_until: u64,
     pub gaps: Vec<(u64, u64)>,
 }

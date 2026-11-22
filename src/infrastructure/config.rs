@@ -98,8 +98,8 @@ impl AgentEntry {
             "Invalid interval or offset"
         );
         ensure!(
-            self.grace >= 120 && self.grace < self.interval,
-            "Grace must be at least 120 seconds and less than interval"
+            self.grace >= 120 && self.grace <= self.interval,
+            "Grace must be at least 120 seconds and at most interval"
         );
         ensure!(
             (102400..=204800).contains(&self.payload_bytes),
@@ -133,6 +133,8 @@ pub struct NtfyConfig {
 pub struct HubConfig {
     pub database: PathBuf,
     pub target: String,
+    #[serde(default)]
+    pub public_port: Option<u16>,
     pub tcp_listen: Vec<SocketAddr>,
     pub udp_listen: Vec<SocketAddr>,
     #[serde(default = "retention")]
@@ -216,6 +218,7 @@ impl Config {
         match self {
             Self::Hub(c) => {
                 ensure!(!c.target.is_empty(), "Hub target is required");
+                ensure!(c.public_port != Some(0), "Public port must be nonzero");
                 ensure!(
                     !c.tcp_listen.is_empty() && !c.udp_listen.is_empty(),
                     "TCP and UDP listeners are required"

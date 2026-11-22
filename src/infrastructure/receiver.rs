@@ -127,7 +127,9 @@ fn authenticate(
     );
     ensure!(
         frame.total as usize == credential.entry.payload_bytes
-            && credential.entry.policy().accepts(frame.cycle, unix_time()),
+            && !credential.entry.paused
+            && (credential.entry.grace == credential.entry.interval
+                || credential.entry.policy().accepts(frame.cycle, unix_time())),
         "Invalid cycle or total"
     );
     {
@@ -135,8 +137,9 @@ fn authenticate(
             .quota
             .lock()
             .map_err(|_| anyhow::anyhow!("Rate limiter unavailable"))?;
-        if quota.0 != frame.cycle {
-            *quota = (frame.cycle, 0);
+        let quota_cycle = unix_time() / credential.entry.interval;
+        if quota.0 != quota_cycle {
+            *quota = (quota_cycle, 0);
         }
         quota.1 = quota.1.saturating_add(bytes.len());
         ensure!(
@@ -331,8 +334,9 @@ pub async fn udp_loop(
                 packet_window.1 += 1;
                 if n > 1232 || packet_window.1 > 50000 { continue; }
                 let Ok((frame,c)) = authenticate(&buffer[..n],&registry,peer,Protocol::Udp) else { continue; };
-                let q = quota.entry(frame.agent.clone()).or_insert((frame.cycle,0));
-                if q.0 != frame.cycle { *q = (frame.cycle,0); }
+                let quota_cycle = unix_time() / c.entry.interval;
+                let q = quota.entry(frame.agent.clone()).or_insert((quota_cycle,0));
+                if q.0 != quota_cycle { *q = (quota_cycle,0); }
                 q.1 += n;
                 if q.1 > c.entry.payload_bytes * 24 { continue; }
                 let id = (frame.agent.clone(),frame.cycle,frame.channel.family,frame.transfer);
@@ -355,7 +359,7 @@ pub async fn udp_loop(
             }
             _ = cleanup.tick() => {
                 let now = unix_time();
-                let expired: Vec<_> = assemblies.iter().filter(|(_,a)| a.expired() || registry.get(&a.frame.agent).is_none_or(|c| !c.entry.policy().accepts(a.frame.cycle,now))).map(|(k,_)| k.clone()).collect();
+                let expired: Vec<_> = assemblies.iter().filter(|(_,a)| a.expired() || registry.get(&a.frame.agent).is_none_or(|c| c.entry.paused || (c.entry.grace != c.entry.interval && !c.entry.policy().accepts(a.frame.cycle,now)))).map(|(k,_)| k.clone()).collect();
                 for id in expired {
                     if let Some(a) = assemblies.remove(&id) && !a.invalid { let _ = submit(&tx,&a.frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await; }
                 }

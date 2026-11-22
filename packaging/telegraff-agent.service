@@ -4,14 +4,18 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=telegraff
 Group=telegraff
 ExecStart=/usr/local/bin/telegraff agent --config /etc/telegraff/agent.toml
-TimeoutStartSec=125
+Restart=on-failure
+RestartSec=5
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

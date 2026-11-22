@@ -1,3 +1,4 @@
+# Legacy unit: disable this timer and enable telegraff-agent.service directly.
 [Unit]
 Description=telegraff hourly transfer schedule
 

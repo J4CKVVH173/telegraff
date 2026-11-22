@@ -1,16 +1,6 @@
-mode = "agent"
-hub = "hub.example.net"
-port = 9477
-timeout_seconds = 120
-udp_bytes_per_second = 131072
-
-[agent]
-name = "node-01"
-key_file = "/etc/telegraff/node-01.key"
-activation = 0
-interval = 3600
-offset = 0
-grace = 600
-families = ["ipv4", "ipv6"]
-payload_bytes = 153600
-udp_threshold = 99
+# Do not hand-edit a second agent configuration or create a separate key.
+# On the hub:
+#   telegraff register node-01 --config hub.toml --output node-01.toml
+# Copy node-01.toml to the agent (mode 0600), then:
+#   telegraff agent --config node-01.toml -d
+# This comment-only file is not a runnable configuration.

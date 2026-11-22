@@ -37,6 +37,7 @@ fn example_configuration_runs_a_hub_and_agent() {
     std::fs::write(&hub_file, hub).unwrap();
     let register = || {
         Command::new(BIN)
+            .current_dir(dir.path())
             .args(["register", "node-01", "--config"])
             .arg(&hub_file)
             .args(["--offset", &offset.to_string()])
@@ -92,7 +93,7 @@ fn example_configuration_runs_a_hub_and_agent() {
     }
     assert!(ready, "Hub did not enroll literal address");
     let result = Command::new(BIN)
-        .args(["agent", "--config"])
+        .args(["agent", "--once", "--config"])
         .arg(&agent_file)
         .output()
         .unwrap();
@@ -141,4 +142,70 @@ fn key_generation_refuses_to_overwrite_a_secret() {
             .success()
     );
     assert_eq!(before, std::fs::read(&key).unwrap());
+}
+
+#[test]
+fn daemon_lifecycle_and_exported_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("hub.toml");
+    let export = dir.path().join("agent.toml");
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    std::fs::write(&config, format!("mode = 'hub'\ndatabase = '{}'\ntarget = '127.0.0.1'\npublic_port = {port}\ntcp_listen = ['127.0.0.1:{port}']\nudp_listen = ['127.0.0.1:{port}']\n", dir.path().join("state.sqlite").display())).unwrap();
+    let result = Command::new(BIN)
+        .args(["register", "test-agent", "--config"])
+        .arg(&config)
+        .arg("--output")
+        .arg(&export)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        std::fs::metadata(&export).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let telegraff::infrastructure::config::Config::Agent(agent) =
+        telegraff::infrastructure::config::Config::load(&export).unwrap()
+    else {
+        panic!("expected agent")
+    };
+    assert_eq!(agent.port, port);
+    assert_eq!(agent.agent.grace, agent.agent.interval);
+    let output_text = String::from_utf8(result.stdout).unwrap();
+    let profile: toml::Value = toml::from_str(&std::fs::read_to_string(&export).unwrap()).unwrap();
+    assert!(!output_text.contains(profile["secret"].as_str().unwrap()));
+    let start = || {
+        Command::new(BIN)
+            .args(["hub", "-d", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap()
+    };
+    assert!(start().status.success());
+    let mut stop = Command::new(BIN);
+    stop.args(["down", "--config"]).arg(&config);
+    // Always stop the child before asserting the duplicate-start outcome.
+    let agent_started = Command::new(BIN)
+        .args(["agent", "-d", "--config"])
+        .arg(&export)
+        .output()
+        .unwrap();
+    let agent_stopped = Command::new(BIN)
+        .args(["down", "--config"])
+        .arg(&export)
+        .output()
+        .unwrap();
+    let duplicate = start();
+    let stopped = stop.output().unwrap();
+    assert!(agent_started.status.success());
+    assert!(agent_stopped.status.success());
+    assert!(!duplicate.status.success());
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(stop.output().unwrap().status.success());
 }

@@ -14,6 +14,10 @@ enum Mode {
     Profile,
 }
 
+fn continuous_default() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Profile {
@@ -22,18 +26,24 @@ pub(super) struct Profile {
     hub: String,
     port: u16,
     offset: u64,
+    #[serde(default = "continuous_default")]
+    continuous: bool,
     pub(super) secret: String,
 }
 
 impl Profile {
     pub(super) fn agent(&self, path: &Path) -> AgentConfig {
-        AgentConfig::registered(
+        let mut config = AgentConfig::registered(
             self.name.clone(),
             path.to_owned(),
             self.hub.clone(),
             self.port,
             self.offset,
-        )
+        );
+        if self.continuous {
+            config.agent.grace = config.agent.interval;
+        }
+        config
     }
 }
 
@@ -71,7 +81,7 @@ pub fn register(hub: &HubConfig, name: &str, port: Option<u16>, offset: u64) -> 
         !hub.agents.iter().any(|a| a.name == name),
         "Agent already registered"
     );
-    let port = port.unwrap_or(hub.tcp_listen[0].port());
+    let port = port.or(hub.public_port).unwrap_or(hub.tcp_listen[0].port());
     ensure!(port > 0 && offset < 3600, "Invalid port or hourly offset");
     let dir = directory(hub);
     fs::DirBuilder::new()
@@ -85,6 +95,7 @@ pub fn register(hub: &HubConfig, name: &str, port: Option<u16>, offset: u64) -> 
         hub: hub.target.clone(),
         port,
         offset,
+        continuous: true,
         secret: hex::encode(rand::random::<[u8; 32]>()),
     };
     let mut file = tempfile::NamedTempFile::new_in(&dir)?;

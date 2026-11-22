@@ -22,12 +22,20 @@ use tokio::{
 pub async fn run(config: HubConfig, resolver: &impl Resolver) -> Result<()> {
     let registry = receiver::registry(&config.agents)?;
     let mut store = SqliteStore::open(&config.database)?;
-    let state = store.load()?;
+    let mut state = store.load()?;
     let policies: Vec<Policy> = config
         .agents
         .iter()
         .map(|a| {
             let mut p = a.policy();
+            if p.grace == p.interval {
+                let anchor = *state
+                    .cycle_anchors
+                    .entry(a.name.clone())
+                    .or_insert_with(unix_time);
+                p.activation = anchor;
+                p.offset = anchor % p.interval;
+            }
             if a.auto {
                 p.families = state.enrolled.get(&a.name).cloned().unwrap_or_default();
             }
@@ -86,6 +94,17 @@ pub async fn run(config: HubConfig, resolver: &impl Resolver) -> Result<()> {
         Box::pin(std::future::pending());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!("Hub started; agents={}", config.agents.len());
+    let probe_host = config.target.clone();
+    let probe_port = config.public_port.unwrap_or(config.tcp_listen[0].port());
+    tasks.spawn(async move {
+        let result = timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((probe_host.as_str(), probe_port))).await;
+        if matches!(result, Ok(Ok(_))) {
+            eprintln!("Startup self-check: public TCP endpoint reachable; UDP and authentication require an agent cycle");
+        } else {
+            eprintln!("Startup self-check FAILED: public TCP endpoint unreachable; check DNS, forwarding and firewall");
+        }
+        std::future::pending::<Result<()>>().await
+    });
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,

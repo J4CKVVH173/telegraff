@@ -2,6 +2,7 @@ mod common;
 use telegraff::infrastructure::config::{Config, HubConfig};
 fn config(key: std::path::PathBuf) -> Config {
     Config::Hub(HubConfig {
+        public_port: None,
         database: "state.sqlite".into(),
         target: "127.0.0.1".into(),
         tcp_listen: vec!["127.0.0.1:9477".parse().unwrap()],

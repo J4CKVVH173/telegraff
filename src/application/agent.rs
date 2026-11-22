@@ -58,11 +58,16 @@ pub async fn run(
 ) -> Result<AgentReport> {
     let policy = &config.policy;
     ensure!(!policy.paused, "Agent is paused");
-    let cycle = policy
-        .cycle_at(clock.now())
-        .ok_or_else(|| anyhow::anyhow!("Agent activation is in the future"))?;
+    let continuous = policy.grace == policy.interval;
+    let cycle = if continuous {
+        clock.now()
+    } else {
+        policy
+            .cycle_at(clock.now())
+            .ok_or_else(|| anyhow::anyhow!("Agent activation is in the future"))?
+    };
     ensure!(
-        policy.accepts(cycle, clock.now()),
+        continuous || policy.accepts(cycle, clock.now()),
         "Outside the scheduled cycle window"
     );
     let started = Instant::now();
@@ -97,14 +102,18 @@ pub async fn run(
             families.push(f);
         }
     }
-    let deadline = (started + Duration::from_secs(config.timeout_seconds)).min(
-        Instant::now()
-            + Duration::from_secs(
-                cycle
-                    .saturating_add(policy.grace)
-                    .saturating_sub(clock.now()),
-            ),
-    );
+    let deadline = if continuous {
+        started + Duration::from_secs(config.timeout_seconds)
+    } else {
+        (started + Duration::from_secs(config.timeout_seconds)).min(
+            Instant::now()
+                + Duration::from_secs(
+                    cycle
+                        .saturating_add(policy.grace)
+                        .saturating_sub(clock.now()),
+                ),
+        )
+    };
     let mut report = AgentReport {
         agent: policy.name.clone(),
         cycle,

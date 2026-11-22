@@ -7,10 +7,27 @@ pub struct Monitor {
     pub retention: u64,
 }
 impl Monitor {
-    pub fn accept(&mut self, result: Transfer, now: u64) -> bool {
+    pub fn accept(&mut self, mut result: Transfer, now: u64) -> bool {
         let Some(policy) = self.policies.iter().find(|p| p.name == result.agent) else {
             return false;
         };
+        if policy.grace == policy.interval {
+            let Some(local_cycle) = policy.cycle_at(now) else {
+                return false;
+            };
+            let tokens = self
+                .state
+                .cycle_tokens
+                .entry(result.agent.clone())
+                .or_default();
+            let mapped = *tokens.entry(result.cycle).or_insert(local_cycle);
+            // A token belongs to one hub interval forever. Old authenticated traffic
+            // cannot count as a fresh successful cycle after a restart.
+            if mapped != local_cycle {
+                return false;
+            }
+            result.cycle = mapped;
+        }
         if !policy.accepts(result.cycle, now)
             || result.transfer >= 3
             || result.bytes > policy.payload_bytes
@@ -45,7 +62,11 @@ impl Monitor {
                 && !result.fingerprint.is_empty()
                 && old.fingerprint != result.fingerprint
             {
-                return false;
+                // A fresh diagnostic run may repeat a successful channel in the
+                // same hub interval; retain the original evidence.
+                return policy.grace == policy.interval
+                    && old.passes(policy)
+                    && result.passes(policy);
             }
             *old = result;
         } else {

@@ -69,6 +69,8 @@ impl Repository for SqliteStore {
             transfers: Vec::new(),
             outbox: state.outbox.clone(),
             next_notification: state.next_notification,
+            cycle_anchors: state.cycle_anchors.clone(),
+            cycle_tokens: state.cycle_tokens.clone(),
             observed_until: state.observed_until,
             gaps: state.gaps.clone(),
         };

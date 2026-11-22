@@ -121,3 +121,31 @@ fn status_reports_partial_failure_and_unenrolled_channels() {
     assert!(!channel.expected);
     assert_eq!(channel.state, "UNENROLLED");
 }
+
+#[test]
+fn continuous_cycles_use_hub_time_and_reject_replays_after_restart() {
+    use telegraff::application::ports::Repository;
+    use telegraff::infrastructure::store::SqliteStore;
+    let mut m = monitor();
+    m.policies[0].activation = 123;
+    m.policies[0].offset = 123;
+    m.policies[0].grace = 3600;
+    m.state.cycle_anchors.insert("node-01".into(), 123);
+    // Token intentionally bears no relation to hub time.
+    assert!(m.accept(transfer(9_000_000, Ipv4, Tcp, 153600), 200));
+    assert_eq!(m.state.transfers[0].cycle, 123);
+    let mut fresh = transfer(9_000_001, Ipv4, Tcp, 153600);
+    fresh.fingerprint = "fresh-run".into();
+    m.state.transfers[0].fingerprint = "first-run".into();
+    assert!(m.accept(fresh, 300));
+    m.tick(3723);
+    assert_eq!(m.state.channels["node-01"]["ipv4/tcp"].failures, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SqliteStore::open(&dir.path().join("state.sqlite")).unwrap();
+    store.save(&m.state).unwrap();
+    m.state = store.load().unwrap();
+    assert_eq!(m.state.cycle_anchors["node-01"], 123);
+    assert!(!m.accept(transfer(9_000_000, Ipv4, Tcp, 153600), 3800));
+    assert!(m.accept(transfer(7, Ipv4, Tcp, 153600), 3800));
+    assert_eq!(m.state.transfers.last().unwrap().cycle, 3723);
+}
