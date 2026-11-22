@@ -1,0 +1,15 @@
+mode = "hub"
+database = "/var/lib/telegraff/state.sqlite"
+target = "hub.example.net"
+# Set to 443 when raw TCP and UDP are forwarded from 443 to the listeners.
+# public_port = 443
+tcp_listen = ["0.0.0.0:9477", "[::]:9477"]
+udp_listen = ["0.0.0.0:9477", "[::]:9477"]
+retention_days = 30
+reminder_seconds = 21600
+max_connections = 64
+max_assemblies = 256
+
+[ntfy]
+endpoint = "https://ntfy.example.net/telegraff"
+# token_file = "/etc/telegraff/ntfy.token"

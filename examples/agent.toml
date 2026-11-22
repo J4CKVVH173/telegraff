@@ -1,0 +1,6 @@
+# Do not hand-edit a second agent configuration or create a separate key.
+# On the hub:
+#   telegraff register node-01 --config hub.toml --output node-01.toml
+# Copy node-01.toml to the agent (mode 0600), then:
+#   telegraff agent --config node-01.toml -d
+# This comment-only file is not a runnable configuration.

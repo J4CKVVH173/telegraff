@@ -1,0 +1,22 @@
+[Unit]
+Description=telegraff hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=telegraff
+Group=telegraff
+ExecStart=/usr/local/bin/telegraff hub --config /etc/telegraff/hub.toml
+Restart=on-failure
+RestartSec=5
+StateDirectory=telegraff
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
