@@ -298,3 +298,190 @@ async fn rejects_expired_certificate_even_when_explicitly_trusted() {
     assert!(error.contains("certificate expired"), "{error}");
     assert!(fixture.intake.try_recv().is_err());
 }
+
+async fn check_native_tls(ip: IpAddr) {
+    use telegraff::infrastructure::config::HubTlsConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["hub.test".into()]).unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, certificate.cert.pem()).unwrap();
+    std::fs::write(&key, certificate.key_pair.serialize_pem()).unwrap();
+    let acceptor = HubTlsConfig {
+        certificate_file: Some(cert.clone()),
+        private_key_file: Some(key),
+    }
+    .acceptor("hub.test")
+    .unwrap();
+    let listener = receiver::bind_tcp((ip, 0).into()).unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut entry = common::entry(common::key_file(dir.path()));
+    entry.grace = entry.interval;
+    let registry = receiver::registry(&[entry]).unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let task = tokio::spawn(receiver::tcp_loop_with_tls(
+        listener,
+        registry,
+        tx,
+        Arc::new(Semaphore::new(8)),
+        Some(acceptor),
+    ));
+    // A bad TLS peer must not stop the listener or reach authenticated intake.
+    let mut untrusted =
+        SocketTransport::for_hub(vec![7; 32], 1048576, "hub.test", None, None).unwrap();
+    let request = TransferRequest {
+        agent: "node-01".into(),
+        cycle: 123456,
+        channel: Channel {
+            family: receiver::family(ip),
+            protocol: Protocol::Tcp,
+        },
+        transfer: 0,
+        total: 153600,
+    };
+    assert!(
+        untrusted
+            .send(
+                address,
+                TransferRequest {
+                    agent: "node-01".into(),
+                    cycle: 123456,
+                    channel: request.channel,
+                    transfer: 0,
+                    total: 153600
+                },
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err()
+    );
+    assert!(rx.try_recv().is_err());
+    let mut transport =
+        SocketTransport::for_hub(vec![7; 32], 1048576, "hub.test", None, Some(&cert)).unwrap();
+    let family = request.channel.family;
+    let identify = transport.identify(IdentityRequest {
+        addresses: vec![address],
+        agent: "node-01".into(),
+        cycle: 123456,
+        total: 153600,
+        observation: Resolution {
+            addresses: vec![ip],
+            ipv4_error: false,
+            ipv6_error: false,
+        }
+        .observation(),
+    });
+    let respond = async {
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event.event, receiver::Incoming::Dns(_, _)));
+        event
+            .accepted
+            .send(receiver::IntakeReply {
+                accepted: true,
+                families: vec![family],
+            })
+            .unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(identify, respond)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, Some(vec![family]));
+    let send = transport.send(address, request, Duration::from_secs(5));
+    let respond = async {
+        let event = rx.recv().await.unwrap();
+        let receiver::Incoming::Transfer(transfer) = event.event else {
+            panic!("transfer expected")
+        };
+        assert_eq!(transfer.bytes, 153600);
+        assert_eq!(transfer.channel.family, family);
+        event
+            .accepted
+            .send(receiver::IntakeReply {
+                accepted: true,
+                families: vec![family],
+            })
+            .unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(send, respond)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), 153600);
+    task.abort();
+    let _ = task.await;
+}
+#[tokio::test]
+async fn native_tls_ipv4_receipts_and_enrollment() {
+    check_native_tls("127.0.0.1".parse().unwrap()).await;
+}
+#[tokio::test]
+async fn native_tls_ipv6_receipts_and_enrollment() {
+    check_native_tls("::1".parse().unwrap()).await;
+}
+#[test]
+fn native_tls_configuration_rejects_bad_credentials() {
+    use telegraff::infrastructure::config::HubTlsConfig;
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    let config = HubTlsConfig {
+        certificate_file: Some(cert.clone()),
+        private_key_file: Some(key.clone()),
+    };
+    assert!(config.acceptor("hub.test").is_err());
+    std::fs::write(&cert, "invalid PEM").unwrap();
+    std::fs::write(&key, "invalid PEM").unwrap();
+    assert!(config.acceptor("hub.test").is_err());
+    let a = rcgen::generate_simple_self_signed(vec!["hub.test".into()]).unwrap();
+    let b = rcgen::generate_simple_self_signed(vec!["hub.test".into()]).unwrap();
+    std::fs::write(&cert, a.cert.pem()).unwrap();
+    assert!(config.acceptor("hub.test").is_err());
+    std::fs::write(&key, b.key_pair.serialize_pem()).unwrap();
+    assert!(config.acceptor("hub.test").is_err());
+    std::fs::write(&key, a.key_pair.serialize_pem()).unwrap();
+    assert!(config.acceptor("hub.test").is_ok());
+}
+
+#[test]
+fn native_tls_automatic_certbot_paths_and_overrides() {
+    use telegraff::infrastructure::config::HubTlsConfig;
+    let automatic: HubTlsConfig = toml::from_str("").unwrap();
+    assert_eq!(
+        automatic.paths("hub.example.net").unwrap(),
+        (
+            PathBuf::from("/etc/letsencrypt/live/hub.example.net/fullchain.pem"),
+            PathBuf::from("/etc/letsencrypt/live/hub.example.net/privkey.pem")
+        )
+    );
+    for target in [
+        "127.0.0.1",
+        "::1",
+        "../bad",
+        "/tmp/example.net",
+        "https://example.net",
+    ] {
+        assert!(automatic.paths(target).is_err());
+    }
+    let explicit = HubTlsConfig {
+        certificate_file: Some("custom-cert.pem".into()),
+        private_key_file: Some("custom-key.pem".into()),
+    };
+    assert_eq!(
+        explicit.paths("127.0.0.1").unwrap(),
+        (
+            PathBuf::from("custom-cert.pem"),
+            PathBuf::from("custom-key.pem")
+        )
+    );
+    let partial = HubTlsConfig {
+        certificate_file: Some("custom.pem".into()),
+        private_key_file: None,
+    };
+    assert_eq!(
+        partial.paths("hub.example.net").unwrap().1,
+        PathBuf::from("/etc/letsencrypt/live/hub.example.net/privkey.pem")
+    );
+}

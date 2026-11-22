@@ -118,6 +118,76 @@ impl Status {
         use crate::utils::paint;
         use std::fmt::Write;
         let mut out = String::new();
+        let (label, code) = if self.last_observation == 0 {
+            ("WAIT", 33)
+        } else if self.last_observation > now {
+            ("CLOCK ERROR", 31)
+        } else if now - self.last_observation > 10 {
+            ("STALE", 33)
+        } else {
+            ("ACTIVE", 32)
+        };
+        write!(out, "Hub: {}", paint(label, code, color)).unwrap();
+        if self.last_observation > 0 {
+            write!(out, " (heartbeat {})", ago(self.last_observation, now)).unwrap();
+        }
+        writeln!(out).unwrap();
+        if self.agents.is_empty() {
+            writeln!(
+                out,
+                "{} (run telegraff register NAME)",
+                paint("Agents: 0", 33, color)
+            )
+            .unwrap();
+        }
+        for agent in &self.agents {
+            write!(
+                out,
+                "{}: {}",
+                agent.name,
+                short_state(&agent.overall, color)
+            )
+            .unwrap();
+            for channel in &agent.channels {
+                if !channel.expected && channel.state != "UNENROLLED" {
+                    continue;
+                }
+                let state = if channel.state == "PENDING" && channel.accepted_bytes > 0 {
+                    "RECEIVED"
+                } else {
+                    &channel.state
+                };
+                write!(out, " | {}: {}", channel.channel, short_state(state, color)).unwrap();
+                if channel.failures > 0 {
+                    write!(out, " ({} failed)", channel.failures).unwrap();
+                }
+            }
+            if agent.enrollment_failures > 0 {
+                write!(out, " | {}", paint("DNS enrollment failed", 31, color)).unwrap();
+            }
+            writeln!(out).unwrap();
+        }
+        if self
+            .dns
+            .values()
+            .any(|s| s.contains("ipv4_error=true") || s.contains("ipv6_error=true"))
+        {
+            writeln!(out, "{}", paint("DNS: lookup failed", 33, color)).unwrap();
+        }
+        if self.queued_notifications > 0 {
+            writeln!(
+                out,
+                "Notifications: {} pending",
+                paint(&self.queued_notifications.to_string(), 33, color)
+            )
+            .unwrap();
+        }
+        out
+    }
+    pub fn verbose_with_color(&self, now: u64, color: bool) -> String {
+        use crate::utils::paint;
+        use std::fmt::Write;
+        let mut out = String::new();
         if self.last_observation == 0 {
             writeln!(
                 out,
@@ -230,8 +300,30 @@ impl Status {
         if let Some(&(start, end)) = self.observation_gaps.last() {
             writeln!(out, "{}: last interruption lasted {}s (ended {}); {} recorded interruption(s). No observations were recorded during that time, so network health was unknown. This is a monitoring interruption, not proof of a network failure.", paint("Monitoring history", 33, color), end.saturating_sub(start), ago(end, now), self.observation_gaps.len()).unwrap();
         }
+        writeln!(out, "Last observation: {}", self.last_observation).unwrap();
+        for (source, observation) in &self.dns {
+            writeln!(out, "DNS {source}: {observation}").unwrap();
+        }
+        for agent in &self.agents {
+            for channel in &agent.channels {
+                writeln!(out, "{} {}: expected={} state={} failures={} last_success={:?} cycle={:?} bytes={} udp_loss={:?}%", agent.name, channel.channel, channel.expected, channel.state, channel.failures, channel.last_success, channel.last_transfer_cycle, channel.accepted_bytes, channel.udp_loss_percent).unwrap();
+            }
+        }
+        for (start, end) in &self.observation_gaps {
+            writeln!(out, "Monitoring interruption: {start}..{end}").unwrap();
+        }
         out
     }
+}
+fn short_state(state: &str, color: bool) -> String {
+    let (label, code) = match state {
+        "OK" => ("OK", 32),
+        "DEGRADED" | "MISSING" | "ALERT" | "FAILING" => ("FAIL", 31),
+        "PENDING" => ("WAIT", 33),
+        "UNENROLLED" => ("UNENROLLED", 33),
+        other => (other, 33),
+    };
+    crate::utils::paint(label, code, color)
 }
 fn colored_meaning(state: &str, color: bool) -> String {
     let code = match state {
@@ -278,17 +370,76 @@ mod human_tests {
             gaps: vec![(10, 94)],
             ..State::default()
         };
-        let text = Status::new(&state, &[]).human(200);
+        let text = Status::new(&state, &[]).verbose_with_color(200, false);
         assert!(text.contains("no recent heartbeat"));
         assert!(text.contains("No agents configured"));
         assert!(text.contains("84s"));
         assert!(text.contains("not proof of a network failure"));
         assert!(!text.contains("dns_set="));
         assert!(!text.contains('\x1b'));
-        let colored = Status::new(&state, &[]).human_with_color(200, true);
+        let colored = Status::new(&state, &[]).verbose_with_color(200, true);
         assert!(colored.contains("\x1b[31mNo agents configured\x1b[0m"));
         assert!(colored.contains("\x1b[33mHub: no recent heartbeat\x1b[0m"));
-        let fresh = Status::new(&state, &[]).human_with_color(101, true);
+        let fresh = Status::new(&state, &[]).verbose_with_color(101, true);
         assert!(fresh.contains("\x1b[32mHub: recent heartbeat\x1b[0m"));
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn compact_pending_and_failures_are_distinct_from_completed_success() {
+        let mut status = Status {
+            last_observation: 100,
+            queued_notifications: 0,
+            dns: BTreeMap::new(),
+            observation_gaps: vec![(1, 50)],
+            agents: vec![AgentStatus {
+                name: "test-node".into(),
+                overall: "PENDING".into(),
+                enrollment_failures: 0,
+                channels: vec![ChannelStatus {
+                    channel: "ipv4/tcp".into(),
+                    expected: true,
+                    state: "PENDING".into(),
+                    failures: 0,
+                    last_success: None,
+                    last_transfer_cycle: Some(90),
+                    accepted_bytes: 153600,
+                    udp_loss_percent: None,
+                }],
+            }],
+        };
+        let text = status.human(101);
+        assert_eq!(
+            text,
+            "Hub: ACTIVE (heartbeat 1s ago)\ntest-node: WAIT | ipv4/tcp: RECEIVED\n"
+        );
+        assert!(!text.contains("Monitoring history"));
+        assert!(
+            status
+                .verbose_with_color(101, false)
+                .contains("Monitoring history")
+        );
+        assert!(
+            status
+                .human_with_color(101, true)
+                .contains("\x1b[33mRECEIVED\x1b[0m")
+        );
+        status.agents[0].overall = "DEGRADED".into();
+        status.agents[0].channels[0].state = "FAILING".into();
+        status.agents[0].channels[0].failures = 1;
+        let text = status.human_with_color(101, true);
+        assert!(text.contains("\x1b[31mFAIL\x1b[0m"));
+        assert!(!text.contains("RECEIVED"));
+        assert!(status.human(120).contains("Hub: STALE"));
+        status.agents[0].overall = "OK".into();
+        status.agents[0].channels[0].state = "OK".into();
+        assert!(
+            status
+                .human_with_color(101, true)
+                .contains("\x1b[32mOK\x1b[0m")
+        );
     }
 }

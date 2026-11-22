@@ -13,6 +13,9 @@ use telegraff::infrastructure::{
 #[derive(Parser)]
 #[command(version, about = "Scheduled TCP and UDP delivery monitoring")]
 struct Cli {
+    /// Show diagnostic details.
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -80,7 +83,7 @@ enum Command {
 #[derive(Subcommand)]
 enum ConfigCommand {
     Check {
-        #[arg(long)]
+        #[arg(long, default_value = "telegraff.toml")]
         config: PathBuf,
     },
 }
@@ -94,11 +97,18 @@ enum KeyCommand {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = execute(Cli::parse()).await {
+    let cli = Cli::parse();
+    telegraff::utils::set_verbose(cli.verbose);
+    if let Err(e) = execute(cli).await {
+        let error = if telegraff::utils::verbose() {
+            format!("Error: {e:#}")
+        } else {
+            format!("Error: {e}")
+        };
         eprintln!(
             "{}",
             telegraff::utils::paint(
-                &format!("Error: {e}"),
+                &error,
                 31,
                 telegraff::utils::color_enabled(std::io::stderr().is_terminal())
             )
@@ -110,7 +120,7 @@ async fn execute(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(command) => command,
         None if std::path::Path::new("telegraff.toml").exists() => {
-            match Config::load(std::path::Path::new("telegraff.toml"))? {
+            match load_config(std::path::Path::new("telegraff.toml"))? {
                 Config::Hub(_) => Command::Hub {
                     config: "telegraff.toml".into(),
                     daemon: false,
@@ -127,13 +137,16 @@ async fn execute(cli: Cli) -> Result<()> {
     };
     match command {
         Command::Unregister { name, config } => {
-            let Config::Hub(hub) = Config::load(&config)? else {
+            let Config::Hub(hub) = load_config(&config)? else {
                 anyhow::bail!("Hub configuration required");
             };
             telegraff::infrastructure::registration::unregister(&hub, &name)?;
-            println!(
-                "Removed {name}. New requests are revoked immediately; the running hub removes its monitoring policy within one second. Historical transfers are retained. The exported agent configuration is not deleted."
-            );
+            telegraff::utils::message(&format!("Removed {name}"), 32);
+            if cli.verbose {
+                println!(
+                    "Credential revoked; monitoring removed within 1s. History and exported profile retained."
+                );
+            }
         }
         Command::Setup => telegraff::infrastructure::setup::run()?,
         Command::Down { config } => telegraff::infrastructure::process::down(&config)?,
@@ -144,7 +157,7 @@ async fn execute(cli: Cli) -> Result<()> {
             offset,
             output,
         } => {
-            let Config::Hub(hub) = Config::load(&config)? else {
+            let Config::Hub(hub) = load_config(&config)? else {
                 anyhow::bail!("Hub configuration required")
             };
             let output = Some(output.unwrap_or_else(|| PathBuf::from(format!("{name}.toml"))));
@@ -165,21 +178,21 @@ async fn execute(cli: Cli) -> Result<()> {
                     .context("Cannot create agent configuration; destination must not exist")?;
                 file.write_all(&std::fs::read(&path)?)?;
                 file.sync_all()?;
+                telegraff::utils::message(&format!("Registered {name}: {}", output.display()), 32);
+                println!("Copy {} to the agent; restart the hub.", output.display());
+            }
+            if cli.verbose {
                 println!(
-                    "Ready-to-copy agent configuration: {} (contains secret; mode 0600)",
-                    output.display()
+                    "Profile contains a private credential (0600); no separate key is needed."
                 );
             }
-            println!(
-                "Registered {name}. Copy the ready-to-copy configuration above to the agent (mode 0600). Restart the hub to load this registration."
-            );
         }
         Command::Hub { config, daemon } => {
             if daemon {
                 return telegraff::infrastructure::process::start("hub", &config);
             }
             let _guard = telegraff::infrastructure::process::guard(&config)?;
-            let Config::Hub(config) = Config::load(&config)? else {
+            let Config::Hub(config) = load_config(&config)? else {
                 anyhow::bail!("Hub configuration required")
             };
             hub::run(config, &Dns::new()?).await?;
@@ -194,7 +207,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 return telegraff::infrastructure::process::start("agent", &config);
             }
             let _guard = telegraff::infrastructure::process::guard(&config)?;
-            let Config::Agent(config) = Config::load(&config)? else {
+            let Config::Agent(config) = load_config(&config)? else {
                 anyhow::bail!("Agent configuration required")
             };
             let settings = telegraff::application::agent::AgentSettings {
@@ -232,10 +245,15 @@ async fn execute(cli: Cli) -> Result<()> {
                     Ok(report) => report,
                     Err(e) if once => return Err(e),
                     Err(e) => {
+                        let detail = if cli.verbose {
+                            format!("{e:#}")
+                        } else {
+                            e.to_string()
+                        };
                         eprintln!(
                             "{}",
                             telegraff::utils::paint(
-                                &format!("Cycle failed: {e}; will retry after interval"),
+                                &format!("Cycle failed: {detail}; retry scheduled"),
                                 31,
                                 telegraff::utils::color_enabled(std::io::stderr().is_terminal())
                             )
@@ -247,23 +265,28 @@ async fn execute(cli: Cli) -> Result<()> {
                         }
                     }
                 };
-                if json || !std::io::stdout().is_terminal() {
+                if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
-                    print!("{}", report.human(telegraff::utils::color_enabled(true)));
+                    let color = telegraff::utils::color_enabled(std::io::stdout().is_terminal());
+                    print!(
+                        "{}",
+                        if cli.verbose {
+                            report.verbose_with_color(color)
+                        } else {
+                            report.human(color)
+                        }
+                    );
                 }
                 if once {
-                    ensure!(
-                        report.successful(),
-                        "One or more expected channels lack a successful receipt; hub intake may differ"
-                    );
+                    ensure!(report.successful(), "Delivery incomplete");
                     break;
                 }
                 if !report.successful() {
                     eprintln!(
                         "{}",
                         telegraff::utils::paint(
-                            "Access check failed for one or more channels; retry scheduled",
+                            "Delivery incomplete; retry scheduled",
                             31,
                             telegraff::utils::color_enabled(std::io::stderr().is_terminal())
                         )
@@ -279,7 +302,15 @@ async fn execute(cli: Cli) -> Result<()> {
         Command::Config {
             command: ConfigCommand::Check { config },
         } => {
-            Config::load(&config)?;
+            let checked = load_config(&config)?;
+            if let Config::Hub(hub) = &checked
+                && let Some(tls) = &hub.tls
+            {
+                tls.acceptor(&hub.target)?;
+            }
+            if cli.verbose {
+                println!("Configuration: {}", config.display());
+            }
             println!(
                 "{}",
                 telegraff::utils::paint(
@@ -301,11 +332,11 @@ async fn execute(cli: Cli) -> Result<()> {
                 .context("Cannot create key file; destination must not exist")?;
             writeln!(file, "{}", hex::encode(key))?;
             file.sync_all()?;
-            println!("Key file created");
+            telegraff::utils::message("Key created", 32);
         }
         Command::Status { config, json } => {
-            let Config::Hub(config) = Config::load(&config)? else {
-                anyhow::bail!("Hub configuration required")
+            let Config::Hub(config) = load_config(&config)? else {
+                anyhow::bail!("Run status on the hub; use agent --once here")
             };
             let state = SqliteStore::read(&config.database)
                 .context("Cannot read hub state; start the hub first and check database access")?;
@@ -326,13 +357,89 @@ async fn execute(cli: Cli) -> Result<()> {
             } else {
                 print!(
                     "{}",
-                    status.human_with_color(
-                        telegraff::utils::unix_time(),
-                        telegraff::utils::color_enabled(std::io::stdout().is_terminal())
-                    )
+                    if cli.verbose {
+                        status.verbose_with_color(
+                            telegraff::utils::unix_time(),
+                            telegraff::utils::color_enabled(std::io::stdout().is_terminal()),
+                        )
+                    } else {
+                        status.human_with_color(
+                            telegraff::utils::unix_time(),
+                            telegraff::utils::color_enabled(std::io::stdout().is_terminal()),
+                        )
+                    }
                 );
             }
         }
     }
     Ok(())
+}
+
+fn load_config(path: &std::path::Path) -> Result<Config> {
+    let config = Config::load(path)?;
+    if telegraff::utils::verbose() {
+        telegraff::utils::log(&format!("Configuration: {}", path.display()), 36);
+        match &config {
+            Config::Hub(hub) => {
+                telegraff::utils::log(
+                    &format!(
+                        "Hub: target={} public_port={:?} tcp={:?} udp={:?} database={} max_connections={} max_assemblies={} notifications={}",
+                        hub.target,
+                        hub.public_port,
+                        hub.tcp_listen,
+                        hub.udp_listen,
+                        hub.database.display(),
+                        hub.max_connections,
+                        hub.max_assemblies,
+                        hub.ntfy.is_some()
+                    ),
+                    36,
+                );
+                if let Some(tls) = &hub.tls {
+                    let (certificate, key) = tls.paths(&hub.target)?;
+                    telegraff::utils::log(
+                        &format!(
+                            "TLS: certificate={} key={}",
+                            certificate.display(),
+                            key.display()
+                        ),
+                        36,
+                    );
+                } else {
+                    telegraff::utils::log("Native TLS: disabled", 36);
+                }
+                for entry in &hub.agents {
+                    telegraff::utils::log(
+                        &format!(
+                            "Policy {}: interval={}s grace={}s offset={}s paused={} auto={} families={:?}",
+                            entry.name,
+                            entry.interval,
+                            entry.grace,
+                            entry.offset,
+                            entry.paused,
+                            entry.auto,
+                            entry.families
+                        ),
+                        36,
+                    );
+                }
+            }
+            Config::Agent(agent) => {
+                telegraff::utils::log(
+                    &format!(
+                        "Agent {}: hub={}:{} tls={:?} timeout={}s interval={}s udp_rate={} bytes/s",
+                        agent.agent.name,
+                        agent.hub,
+                        agent.port,
+                        agent.tls,
+                        agent.timeout_seconds,
+                        agent.agent.interval,
+                        agent.udp_bytes_per_second
+                    ),
+                    36,
+                );
+            }
+        }
+    }
+    Ok(config)
 }

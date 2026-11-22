@@ -93,7 +93,7 @@ fn example_configuration_runs_a_hub_and_agent() {
     }
     assert!(ready, "Hub did not enroll literal address");
     let result = Command::new(BIN)
-        .args(["agent", "--once", "--config"])
+        .args(["agent", "--once", "--json", "--config"])
         .arg(&agent_file)
         .output()
         .unwrap();
@@ -178,12 +178,19 @@ fn daemon_lifecycle_and_exported_profile() {
     assert!(!output_text.contains(profile["secret"].as_str().unwrap()));
     let start = || {
         Command::new(BIN)
-            .args(["hub", "-d", "--config"])
+            .args(["hub", "-dv", "--config"])
             .arg(&config)
             .output()
             .unwrap()
     };
-    assert!(start().status.success());
+    let started = start();
+    assert!(started.status.success());
+    let start_text = String::from_utf8(started.stdout).unwrap();
+    let log_path = start_text
+        .lines()
+        .find_map(|line| line.strip_prefix("Log: "))
+        .unwrap()
+        .to_owned();
     let mut stop = Command::new(BIN);
     stop.args(["down", "--config"]).arg(&config);
     // Always stop the child before asserting the duplicate-start outcome.
@@ -208,6 +215,12 @@ fn daemon_lifecycle_and_exported_profile() {
         String::from_utf8_lossy(&stopped.stderr)
     );
     assert!(stop.output().unwrap().status.success());
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        log.contains("Configuration:"),
+        "verbose flag was not forwarded to the daemon"
+    );
+    assert!(!log.contains(profile["secret"].as_str().unwrap()));
 }
 
 #[test]
@@ -230,11 +243,25 @@ fn status_uses_default_config_and_explains_empty_monitoring() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("No agents configured"));
-    assert!(text.contains("no observations yet"));
+    assert!(text.contains("Agents: 0"));
+    assert!(text.contains("Hub: WAIT"));
+    assert!(!text.contains("Last observation:"));
+    assert!(!text.contains('\x1b'));
+    for args in [["status", "--verbose"], ["-v", "status"], ["status", "-v"]] {
+        let verbose = Command::new(BIN)
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(verbose.status.success());
+        let detail = String::from_utf8(verbose.stdout).unwrap();
+        assert!(detail.contains("Last observation: 0"));
+        assert!(detail.contains("Notifications waiting to be sent: 0"));
+        assert!(!detail.contains('\x1b'));
+    }
     let json = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["status", "--json"])
+        .args(["status", "--json", "--verbose"])
         .output()
         .unwrap();
     assert!(json.status.success());

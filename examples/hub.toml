@@ -13,3 +13,10 @@ max_assemblies = 256
 [ntfy]
 endpoint = "https://ntfy.example.net/telegraff"
 # token_file = "/etc/telegraff/ntfy.token"
+
+# Native TLS: use when nginx stream passes TLS through to this TCP listener.
+# Omit this table when nginx terminates TLS and proxies plain HTTP instead.
+# [tls]
+# Paths default to /etc/letsencrypt/live/<target>/. Uncomment [tls] alone to enable.
+# certificate_file = "/etc/letsencrypt/live/hub.example.net/fullchain.pem"
+# private_key_file = "/etc/letsencrypt/live/hub.example.net/privkey.pem"

@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, mpsc, oneshot},
     time::timeout,
@@ -103,7 +103,7 @@ pub async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
     stream.read_exact(&mut bytes).await?;
     Ok(bytes)
 }
-pub async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+pub async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<()> {
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(bytes).await?;
     Ok(())
@@ -194,17 +194,35 @@ pub async fn tcp_loop(
     tx: mpsc::Sender<Intake>,
     permits: Arc<Semaphore>,
 ) -> Result<()> {
+    tcp_loop_with_tls(listener, registry, tx, permits, None).await
+}
+trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
+pub async fn tcp_loop_with_tls(
+    listener: TcpListener,
+    registry: Registry,
+    tx: mpsc::Sender<Intake>,
+    permits: Arc<Semaphore>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> Result<()> {
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue;
         };
         let registry = registry.clone();
         let tx = tx.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = timeout(Duration::from_secs(10), async {
+            let result = timeout(Duration::from_secs(10), async {
                 let start = Instant::now();
+                // Handshake shares the bounded request deadline and connection permit.
+                let mut stream: Box<dyn Connection> = if let Some(tls) = tls {
+                    Box::new(tls.accept(stream).await?)
+                } else {
+                    Box::new(stream)
+                };
                 let (bytes, http) = super::http::read_request(&mut stream).await?;
                 let (frame, c) = authenticate(&bytes, &registry, peer, Protocol::Tcp, http)?;
                 if frame.kind == super::wire::IDENTITY {
@@ -263,6 +281,15 @@ pub async fn tcp_loop(
                 Ok::<_, anyhow::Error>(())
             })
             .await;
+            if crate::utils::verbose() {
+                match result {
+                    Ok(Err(error)) => {
+                        crate::utils::log(&format!("TCP request rejected: {error:#}"), 31)
+                    }
+                    Err(_) => crate::utils::log("TCP request timed out (10s)", 31),
+                    _ => {}
+                }
+            }
         });
     }
 }

@@ -223,6 +223,58 @@ impl AgentReport {
     pub fn human(&self, color: bool) -> String {
         use crate::utils::paint;
         use std::fmt::Write;
+        let mut out = format!(
+            "{}: {}",
+            self.agent,
+            paint(
+                if self.successful() { "OK" } else { "FAIL" },
+                if self.successful() { 32 } else { 31 },
+                color
+            )
+        );
+        for channel in &self.channels {
+            let success = channel.accepted == Some(true) && channel.receipt_received;
+            let label = if success { "OK" } else { "FAIL" };
+            write!(
+                out,
+                " | {}: {}",
+                channel.channel,
+                paint(label, if success { 32 } else { 31 }, color)
+            )
+            .unwrap();
+            if !channel.expected {
+                out.push_str(" (optional)");
+            }
+            if !success {
+                let error = channel
+                    .transfers
+                    .iter()
+                    .rev()
+                    .find_map(|attempt| attempt.error.as_deref());
+                let reason = match error.map(str::to_ascii_lowercase) {
+                    Some(e) if e.contains("certificate") || e.contains("tls") => "TLS error",
+                    Some(e)
+                        if e.contains("timed out")
+                            || e.contains("timeout")
+                            || e.contains("deadline") =>
+                    {
+                        "timeout"
+                    }
+                    Some(e) if e.contains("connect") => "connection failed",
+                    _ => "no receipt",
+                };
+                write!(out, " ({reason})").unwrap();
+            }
+        }
+        if self.channels.is_empty() {
+            out.push_str(" | no target channels");
+        }
+        out.push('\n');
+        out
+    }
+    pub fn verbose_with_color(&self, color: bool) -> String {
+        use crate::utils::paint;
+        use std::fmt::Write;
         let mut out = String::new();
         let (summary, code) = if self.successful() {
             ("PASS: all expected channels confirmed delivery", 32)
@@ -277,6 +329,25 @@ impl AgentReport {
             )
             .unwrap();
         }
+        writeln!(out, "Cycle: {}\nDNS: {}", self.cycle, self.dns).unwrap();
+        for channel in &self.channels {
+            for attempt in &channel.transfers {
+                writeln!(
+                    out,
+                    "  {} attempt {}: receipt={} bytes={}{}",
+                    channel.channel,
+                    attempt.transfer + 1,
+                    attempt.receipt_received,
+                    attempt.accepted_bytes,
+                    attempt
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                )
+                .unwrap();
+            }
+        }
         out
     }
 }
@@ -309,13 +380,58 @@ mod human_tests {
                 },
             ],
         };
-        let plain = report.human(false);
+        let plain = report.verbose_with_color(false);
         assert!(plain.contains("PASS: all expected channels"));
         assert!(plain.contains("additional channel; not required"));
         assert!(plain.contains("FAIL: no successful receipt"));
         assert!(!plain.contains('\x1b'));
-        let colored = report.human(true);
+        let colored = report.verbose_with_color(true);
         assert!(colored.contains("\x1b[32mPASS"));
         assert!(colored.contains("\x1b[31mFAIL"));
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn compact_probe_keeps_reason_and_verbose_keeps_every_attempt() {
+        let report = AgentReport {
+            agent: "test-node".into(),
+            cycle: 123,
+            dns: "dns-diagnostic".into(),
+            channels: vec![ChannelReport {
+                channel: "ipv4/udp".into(),
+                expected: true,
+                accepted: None,
+                receipt_received: false,
+                accepted_bytes: 0,
+                transfers: vec![
+                    Attempt {
+                        error: Some("Transfer timed out".into()),
+                        transfer: 0,
+                        receipt_received: false,
+                        accepted_bytes: 0,
+                    },
+                    Attempt {
+                        error: Some("deadline has elapsed".into()),
+                        transfer: 1,
+                        receipt_received: false,
+                        accepted_bytes: 0,
+                    },
+                ],
+            }],
+        };
+        assert_eq!(
+            report.human(false),
+            "test-node: FAIL | ipv4/udp: FAIL (timeout)\n"
+        );
+        let verbose = report.verbose_with_color(false);
+        assert!(verbose.contains("Cycle: 123"));
+        assert!(verbose.contains("dns-diagnostic"));
+        assert!(verbose.contains("attempt 1:"));
+        assert!(verbose.contains("attempt 2:"));
+        assert!(verbose.contains("Transfer timed out"));
+        assert!(!verbose.contains('\x1b'));
     }
 }

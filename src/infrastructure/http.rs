@@ -1,10 +1,7 @@
 //! A bounded HTTP envelope for encrypted telegraff frames behind nginx.
 use super::wire::{HEADER, MAX_FRAME, TAG};
 use anyhow::{Result, ensure};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const MAX_HEADERS: usize = 8192;
 fn content_length(bytes: &[u8]) -> Result<usize> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -46,7 +43,7 @@ fn content_length(bytes: &[u8]) -> Result<usize> {
     );
     Ok(length)
 }
-pub(super) async fn read_request(stream: &mut TcpStream) -> Result<(Vec<u8>, bool)> {
+pub(super) async fn read_request(stream: &mut (impl AsyncRead + Unpin)) -> Result<(Vec<u8>, bool)> {
     let mut prefix = [0; 4];
     stream.read_exact(&mut prefix).await?;
     if &prefix != b"POST" {
@@ -69,7 +66,11 @@ pub(super) async fn read_request(stream: &mut TcpStream) -> Result<(Vec<u8>, boo
     stream.read_exact(&mut bytes).await?;
     Ok((bytes, true))
 }
-pub(super) async fn write_response(stream: &mut TcpStream, bytes: &[u8], http: bool) -> Result<()> {
+pub(super) async fn write_response(
+    stream: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+    http: bool,
+) -> Result<()> {
     if !http {
         return super::receiver::write_frame(stream, bytes).await;
     }

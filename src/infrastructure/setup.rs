@@ -6,7 +6,14 @@ use std::{
     path::PathBuf,
 };
 fn ask(question: &str, default: &str) -> Result<String> {
-    print!("{question} [{default}]: ");
+    print!(
+        "{} [{default}]: ",
+        crate::utils::paint(
+            question,
+            36,
+            crate::utils::color_enabled(io::stdout().is_terminal())
+        )
+    );
     io::stdout().flush()?;
     let mut answer = String::new();
     ensure!(io::stdin().read_line(&mut answer)? > 0, "Setup input ended");
@@ -33,7 +40,7 @@ pub fn run() -> Result<()> {
             "Destination exists and is not an agent configuration; choose another file. Nothing was overwritten"
         );
         println!(
-            "Agent is already configured. Nothing needs to be deleted.\nStart: telegraff agent --config {} -d",
+            "Already configured.\nStart: telegraff agent --config {} -d",
             destination.display()
         );
         return Ok(());
@@ -44,7 +51,7 @@ pub fn run() -> Result<()> {
     );
     if role == "agent" {
         println!(
-            "On the hub, run: telegraff register NAME\nIt creates NAME.toml. Copy that file to this agent first.\nThe file already contains the hub address, name and key. Do not delete existing files or create a separate key."
+            "On hub: telegraff register NAME\nCopy NAME.toml here (includes address and key)."
         );
         let mut candidates = Vec::new();
         for entry in std::fs::read_dir(".")? {
@@ -76,9 +83,12 @@ pub fn run() -> Result<()> {
             )?);
             match profile_contents(&source) {
                 Ok(contents) => break contents,
-                Err(error) => println!(
-                    "Cannot use {}: {error}.\nCopy the file from the hub, check its path, then try again. No files were changed.",
-                    source.display()
+                Err(error) => crate::utils::message(
+                    &format!(
+                        "Cannot read {}: {error}. Check the path and retry.",
+                        source.display()
+                    ),
+                    31,
                 ),
             }
         };
@@ -118,6 +128,37 @@ pub fn run() -> Result<()> {
                 ]),
             );
         }
+        let native_tls = ask(
+            "Enable native TLS (yes/no; yes for nginx TLS passthrough)",
+            "no",
+        )?;
+        ensure!(
+            matches!(native_tls.as_str(), "yes" | "no"),
+            "Choose yes or no for TLS"
+        );
+        if native_tls == "yes" {
+            let certificate = ask(
+                "TLS certificate PEM file (empty: automatic certbot path)",
+                "",
+            )?;
+            let key = ask(
+                "TLS private key PEM file (empty: automatic certbot path)",
+                "",
+            )?;
+            let tls = super::config::HubTlsConfig {
+                certificate_file: (!certificate.is_empty()).then(|| certificate.clone().into()),
+                private_key_file: (!key.is_empty()).then(|| key.clone().into()),
+            };
+            tls.acceptor(&host)?;
+            let mut tls = toml::Table::new();
+            if !certificate.is_empty() {
+                tls.insert("certificate_file".into(), toml::Value::String(certificate));
+            }
+            if !key.is_empty() {
+                tls.insert("private_key_file".into(), toml::Value::String(key));
+            }
+            table.insert("tls".into(), toml::Value::Table(tls));
+        }
         let endpoint = ask("ntfy HTTPS endpoint (empty to disable notifications)", "")?;
         if !endpoint.is_empty() {
             let mut ntfy = toml::Table::new();
@@ -140,9 +181,9 @@ pub fn run() -> Result<()> {
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
     }
+    crate::utils::message(&format!("Saved {}", destination.display()), 32);
     println!(
-        "Saved {}. Start: telegraff {role} --config {} -d",
-        destination.display(),
+        "Start: telegraff {role} --config {} -d",
         destination.display()
     );
     if role == "hub" {

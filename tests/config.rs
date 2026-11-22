@@ -3,6 +3,7 @@ use telegraff::infrastructure::config::{Config, HubConfig};
 fn config(key: std::path::PathBuf) -> Config {
     Config::Hub(HubConfig {
         public_port: None,
+        tls: None,
         database: "state.sqlite".into(),
         target: "127.0.0.1".into(),
         tcp_listen: vec!["127.0.0.1:9477".parse().unwrap()],
@@ -45,4 +46,21 @@ fn secrets_require_restricted_permissions_and_parse_errors_do_not_echo_input() {
     std::fs::write(&file, "private_value = 'test-marker'\ninvalid syntax").unwrap();
     let error = Config::load(&file).unwrap_err().to_string();
     assert!(!error.contains("test-marker"));
+}
+
+#[test]
+fn hub_tls_table_enables_automatic_certbot_paths() {
+    let source = include_str!("../examples/hub.toml").replace("# [tls]", "[tls]");
+    let Config::Hub(hub) = toml::from_str::<Config>(&source).unwrap() else {
+        panic!("hub expected")
+    };
+    let paths = hub.tls.unwrap().paths(&hub.target).unwrap();
+    assert_eq!(
+        paths.0,
+        std::path::PathBuf::from("/etc/letsencrypt/live/hub.example.net/fullchain.pem")
+    );
+    assert_eq!(
+        paths.1,
+        std::path::PathBuf::from("/etc/letsencrypt/live/hub.example.net/privkey.pem")
+    );
 }

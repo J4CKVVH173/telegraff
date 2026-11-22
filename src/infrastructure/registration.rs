@@ -128,7 +128,7 @@ pub fn register(hub: &HubConfig, name: &str, port: Option<u16>, offset: u64) -> 
         port,
         offset,
         continuous: true,
-        tls: None,
+        tls: hub.tls.as_ref().map(|_| true),
         ca_file: None,
         secret: hex::encode(rand::random::<[u8; 32]>()),
     };

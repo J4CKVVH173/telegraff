@@ -1,3 +1,26 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+pub fn set_verbose(enabled: bool) {
+    VERBOSE.store(enabled, Ordering::Relaxed);
+}
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+pub fn message(text: &str, code: u8) {
+    use std::io::IsTerminal;
+    println!(
+        "{}",
+        paint(text, code, color_enabled(std::io::stdout().is_terminal()))
+    );
+}
+pub fn log(text: &str, code: u8) {
+    use std::io::IsTerminal;
+    eprintln!(
+        "{}",
+        paint(text, code, color_enabled(std::io::stderr().is_terminal()))
+    );
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn color_enabled(terminal: bool) -> bool {

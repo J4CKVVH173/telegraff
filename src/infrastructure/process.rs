@@ -46,7 +46,12 @@ pub fn guard(config: &Path) -> Result<File> {
     Ok(file)
 }
 pub fn start(role: &str, config: &Path) -> Result<()> {
-    super::config::Config::load(config)?;
+    let checked = super::config::Config::load(config)?;
+    if let super::config::Config::Hub(hub) = &checked
+        && let Some(tls) = &hub.tls
+    {
+        tls.acceptor(&hub.target)?;
+    }
     let config = config.canonicalize()?;
     let lock = OpenOptions::new()
         .create(true)
@@ -66,6 +71,11 @@ pub fn start(role: &str, config: &Path) -> Result<()> {
     let mut child = Command::new("setsid")
         .arg(std::env::current_exe()?)
         .arg(role)
+        .args(if crate::utils::verbose() {
+            vec!["--verbose"]
+        } else {
+            vec![]
+        })
         .arg("--config")
         .arg(&config)
         .stdin(Stdio::null())
@@ -75,13 +85,20 @@ pub fn start(role: &str, config: &Path) -> Result<()> {
         .context("Cannot start background process (setsid required)")?;
     std::thread::sleep(Duration::from_millis(300));
     if let Some(status) = child.try_wait()? {
-        anyhow::bail!("Background process exited ({status}); inspect the configuration .log file");
+        anyhow::bail!(
+            "{role} failed ({status}); log: {}",
+            sidecar(&config, "log")?.display()
+        );
     }
-    println!(
-        "Started {role}; use telegraff down --config {} to stop. Logs: {}",
-        config.display(),
-        sidecar(&config, "log")?.display()
-    );
+    crate::utils::message(&format!("Started {role}"), 32);
+    if crate::utils::verbose() {
+        println!(
+            "Config: {}\nLog: {}\nPID: {}",
+            config.display(),
+            sidecar(&config, "log")?.display(),
+            child.id()
+        );
+    }
     Ok(())
 }
 pub fn down(config: &Path) -> Result<()> {
@@ -91,7 +108,7 @@ pub fn down(config: &Path) -> Result<()> {
         .open(sidecar(config, "pid")?)
         .context("No process record for this configuration")?;
     if file.try_lock().is_ok() {
-        println!("Already stopped");
+        crate::utils::message("Already stopped", 33);
         return Ok(());
     }
     let mut text = String::new();
@@ -126,7 +143,7 @@ pub fn down(config: &Path) -> Result<()> {
     );
     for _ in 0..100 {
         if file.try_lock().is_ok() {
-            println!("Stopped");
+            crate::utils::message("Stopped", 32);
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));

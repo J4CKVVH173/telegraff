@@ -130,7 +130,63 @@ pub struct NtfyConfig {
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HubTlsConfig {
+    pub certificate_file: Option<PathBuf>,
+    pub private_key_file: Option<PathBuf>,
+}
+impl HubTlsConfig {
+    pub fn paths(&self, target: &str) -> Result<(PathBuf, PathBuf)> {
+        let automatic = self.certificate_file.is_none() || self.private_key_file.is_none();
+        if automatic {
+            ensure!(
+                target.contains('.')
+                    && target
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+                    && !target.contains("..")
+                    && target.parse::<std::net::IpAddr>().is_err(),
+                "Automatic certbot paths require a DNS target; set certificate_file and private_key_file explicitly for IP targets"
+            );
+        }
+        let directory = Path::new("/etc/letsencrypt/live").join(target);
+        let certificate_file = self
+            .certificate_file
+            .clone()
+            .unwrap_or_else(|| directory.join("fullchain.pem"));
+        let private_key_file = self
+            .private_key_file
+            .clone()
+            .unwrap_or_else(|| directory.join("privkey.pem"));
+        Ok((certificate_file, private_key_file))
+    }
+    pub fn acceptor(&self, target: &str) -> Result<tokio_rustls::TlsAcceptor> {
+        use tokio_rustls::rustls::{
+            self,
+            pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+        };
+        let (certificate_file, private_key_file) = self.paths(target)?;
+        let certificates = CertificateDer::pem_file_iter(&certificate_file)
+            .with_context(|| format!("Cannot read TLS certificate file {}; issue the certificate with certbot or set tls.certificate_file", certificate_file.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Invalid TLS certificate PEM")?;
+        ensure!(
+            !certificates.is_empty(),
+            "TLS certificate file contains no certificates"
+        );
+        let key = PrivateKeyDer::from_pem_file(&private_key_file)
+            .with_context(|| format!("Cannot read TLS private key PEM {}; check permissions and use an unencrypted PEM key", private_key_file.display()))?;
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+            .context("Invalid TLS certificate chain or mismatched private key")?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+    }
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HubConfig {
+    pub tls: Option<HubTlsConfig>,
     pub database: PathBuf,
     pub target: String,
     #[serde(default)]

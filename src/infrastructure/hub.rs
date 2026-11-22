@@ -20,6 +20,11 @@ use tokio::{
 };
 
 pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> {
+    let tls = config
+        .tls
+        .as_ref()
+        .map(|tls| tls.acceptor(&config.target))
+        .transpose()?;
     let registry = receiver::registry(&config.agents)?;
     let mut store = SqliteStore::open(&config.database)?;
     let mut state = store.load()?;
@@ -73,11 +78,12 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     for addr in &config.tcp_listen {
-        tasks.spawn(receiver::tcp_loop(
+        tasks.spawn(receiver::tcp_loop_with_tls(
             receiver::bind_tcp(*addr)?,
             registry.clone(),
             tx.clone(),
             permits.clone(),
+            tls.clone(),
         ));
     }
     for addr in &config.udp_listen {
@@ -112,15 +118,33 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
     let mut dns_future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
         Box::pin(std::future::pending());
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    eprintln!("Hub started; agents={}", config.agents.len());
+    crate::utils::log("Hub: started", 32);
     let probe_host = config.target.clone();
     let probe_port = config.public_port.unwrap_or(config.tcp_listen[0].port());
     tasks.spawn(async move {
-        let result = timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((probe_host.as_str(), probe_port))).await;
+        let result = timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect((probe_host.as_str(), probe_port)),
+        )
+        .await;
         if matches!(result, Ok(Ok(_))) {
-            eprintln!("Startup self-check: public TCP endpoint reachable; UDP and authentication require an agent cycle");
+            crate::utils::log("Public TCP: reachable", 32);
+            if crate::utils::verbose() {
+                crate::utils::log(
+                    "Reachability only; TLS, authentication and UDP require an agent cycle",
+                    36,
+                );
+            }
         } else {
-            eprintln!("Startup self-check FAILED: public TCP endpoint unreachable; check DNS, forwarding and firewall");
+            crate::utils::log("Public TCP: unreachable", 31);
+            if crate::utils::verbose() {
+                crate::utils::log(
+                    &format!(
+                        "Endpoint: {probe_host}:{probe_port}; check DNS, forwarding and firewall"
+                    ),
+                    36,
+                );
+            }
         }
         std::future::pending::<Result<()>>().await
     });
@@ -159,7 +183,7 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
                 in_flight = false;
                 if monitor.state.outbox.first().is_some_and(|n| n.id == id) {
                     ensure!(monitor.state.complete_notification(id,ok,unix_time()), "Notification order mismatch");
-                    if !ok { eprintln!("Notification delivery failed; retry scheduled"); }
+                    if !ok { crate::utils::log("Notification failed; retry scheduled", 31); }
                 } else {
                     // unregister may cancel this notification while delivery is
                     // in flight. An already dispatched request cannot be recalled.
@@ -187,6 +211,6 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
     }
     store.save(&monitor.state)?;
     tasks.abort_all();
-    eprintln!("Hub stopped");
+    crate::utils::log("Hub: stopped", 33);
     Ok(())
 }
