@@ -6,6 +6,7 @@ The hub sends an ntfy alert after three consecutive failed cycles for a channel.
 
 ![graff](global/baner.png)
 
+
 ## Requirements
 
 Use Linux with systemd, synchronized clocks, and working DNS.
