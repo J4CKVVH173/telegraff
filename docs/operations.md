@@ -66,7 +66,7 @@ and preserves history and exported files. Explicit `[[agents]]` entries must be 
 Re-registering creates a new credential: replace the agent profile as well.
 
 Registered agents probe immediately, then repeat at their configured interval. The hub assigns cycles to persisted
-intervals; final results appear when an interval closes. `RECEIVED` is provisional; the agent summary shows received/expected channel counts until the first result.
+intervals. A transfer meeting the channel success threshold immediately shows `OK` in status, including JSON, superseding older failures. Missing or insufficient transfers retain the previous result until the interval closes. `RECEIVED` indicates provisional intake that has not met the success threshold. Finalized monitoring counters and notification timing are unchanged.
 `status -v` shows the interval length and next result time. No receipt means delivery is
 unconfirmed, even if the hub received some data. Three failed intervals trigger an alert; recovery is notified after
 a successful interval. Reminders default to six hours (`reminder_seconds = 0` disables them).

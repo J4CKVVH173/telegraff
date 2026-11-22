@@ -52,6 +52,19 @@ impl Status {
                             .iter()
                             .filter(|t| t.agent == p.name && t.channel == channel)
                             .max_by_key(|t| (t.cycle, t.bytes));
+                        // Project accepted successes immediately, without changing the
+                        // monitor's finalized counters or notification schedule.
+                        let fresh_success = state
+                            .transfers
+                            .iter()
+                            .filter(|t| {
+                                t.agent == p.name
+                                    && t.channel == channel
+                                    && saved.last_finalized.is_none_or(|cycle| t.cycle > cycle)
+                                    && t.passes(p)
+                            })
+                            .map(|t| t.cycle)
+                            .max();
                         let bytes = last.map_or(0, |t| t.bytes);
                         channels.push(ChannelStatus {
                             channel: label,
@@ -59,15 +72,23 @@ impl Status {
                             state: if p.paused {
                                 "PAUSED"
                             } else if expected {
-                                saved.label()
+                                if fresh_success.is_some() {
+                                    "OK"
+                                } else {
+                                    saved.label()
+                                }
                             } else if last.is_some() {
                                 "UNENROLLED"
                             } else {
                                 "NOT_APPLICABLE"
                             }
                             .into(),
-                            failures: if expected { saved.failures } else { 0 },
-                            last_success: saved.last_success,
+                            failures: if expected && fresh_success.is_none() {
+                                saved.failures
+                            } else {
+                                0
+                            },
+                            last_success: fresh_success.or(saved.last_success),
                             last_transfer_cycle: last.map(|t| t.cycle),
                             accepted_bytes: bytes,
                             udp_loss_percent: (protocol == Protocol::Udp && last.is_some())
@@ -397,7 +418,7 @@ mod tests {
         let compact = status.human(200);
         assert_eq!(
             compact,
-            "Hub: ACTIVE (hub state updated 0s ago)\nnode: 1/2 channels received | ipv4/tcp: RECEIVED | ipv4/udp: NO DATA\n"
+            "Hub: ACTIVE (hub state updated 0s ago)\nnode: 1/2 channels received | ipv4/tcp: OK | ipv4/udp: NO DATA\n"
         );
         let verbose = status.verbose_with_color(200, false);
         assert!(verbose.contains("interval 1h"));
@@ -430,16 +451,15 @@ mod tests {
         );
     }
     #[test]
-    fn received_data_does_not_claim_final_success_or_hide_failures() {
+    fn successful_intake_updates_status_before_finalization() {
         let (mut state, policy) = fixture();
         let mut udp = state.transfers[0].clone();
         udp.channel.protocol = Protocol::Udp;
         state.transfers.push(udp);
         let status = Status::new(&state, std::slice::from_ref(&policy));
-        assert!(status.human(200).contains("2/2 channels received"));
+        assert!(status.human(200).contains("node: OK"));
         let colored = status.human_with_color(200, true);
-        assert!(colored.contains("\x1b[33mRECEIVED\x1b[0m"));
-        assert!(!colored.contains("\x1b[32mOK"));
+        assert!(colored.contains("\x1b[32mOK\x1b[0m"));
         state.channels.insert(
             "node".into(),
             BTreeMap::from([
@@ -473,6 +493,57 @@ mod tests {
                 .contains("\x1b[32mOK\x1b[0m")
         );
         assert_eq!(status.agents[0].next_result_at, Some(7300));
+    }
+    #[test]
+    fn fresh_tcp_success_overrides_old_failure_but_not_udp_failure() {
+        let (mut state, policy) = fixture();
+        state.channels.insert(
+            "node".into(),
+            BTreeMap::from([
+                (
+                    "ipv4/tcp".into(),
+                    ChannelState {
+                        failures: 3,
+                        last_finalized: Some(99),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "ipv4/udp".into(),
+                    ChannelState {
+                        failures: 2,
+                        last_finalized: Some(99),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        );
+        let status = Status::new(&state, std::slice::from_ref(&policy));
+        assert!(
+            status
+                .human(200)
+                .contains("node: FAIL | ipv4/tcp: OK | ipv4/udp: FAIL (2 failed)")
+        );
+        assert!(
+            status
+                .verbose_with_color(200, false)
+                .contains("ipv4/tcp: OK; 150 KiB received")
+        );
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["agents"][0]["channels"][0]["state"], "OK");
+        assert_eq!(json["agents"][0]["channels"][0]["failures"], 0);
+        assert_eq!(state.channels["node"]["ipv4/tcp"].failures, 3);
+        // Invalid, incomplete, and already finalized receipts cannot recover it.
+        for (invalid, bytes, cycle) in [(true, 153600, 100), (false, 1, 100), (false, 153600, 99)] {
+            state.transfers[0].invalid = invalid;
+            state.transfers[0].bytes = bytes;
+            state.transfers[0].cycle = cycle;
+            assert!(
+                Status::new(&state, std::slice::from_ref(&policy))
+                    .human(200)
+                    .contains("ipv4/tcp: FAIL (3 failed)")
+            );
+        }
     }
     #[test]
     fn no_data_stale_paused_and_unenrolled_are_not_success() {
