@@ -150,3 +150,63 @@ pub fn down(config: &Path) -> Result<()> {
     }
     anyhow::bail!("Shutdown still in progress; retry down shortly")
 }
+
+/// Restart a daemon after its registry changes, preserving its working directory.
+pub fn restart_hub_if_running(config: &Path) -> Result<()> {
+    let record = sidecar(config, "pid")?;
+    let mut file = match OpenOptions::new().read(true).write(true).open(&record) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if file.try_lock().is_ok() {
+        return Ok(());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let pid: u32 = text.trim().parse().context("Invalid process record")?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .context("Invalid process status")?
+        .1
+        .split_whitespace()
+        .collect();
+    // setsid daemons lead their own session. Foreground and supervised hubs
+    // retain their existing lifecycle owner.
+    if fields.get(3).and_then(|s| s.parse::<u32>().ok()) != Some(pid) {
+        crate::utils::message(
+            "Restart the foreground or supervised hub to load the registration.",
+            33,
+        );
+        return Ok(());
+    }
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    if cgroup.lines().any(|line| line.ends_with(".service")) {
+        crate::utils::message("Restart the hub service to load the registration.", 33);
+        return Ok(());
+    }
+    let checked = super::config::Config::load(config)?;
+    let super::config::Config::Hub(hub) = checked else {
+        anyhow::bail!("Hub configuration required");
+    };
+    if let Some(tls) = &hub.tls {
+        tls.acceptor(&hub.target)?;
+    }
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))?;
+    let config = config.canonicalize()?;
+    down(&config)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .current_dir(cwd)
+        .args(["hub", "-d", "--config"])
+        .arg(config);
+    if crate::utils::verbose() {
+        command.arg("--verbose");
+    }
+    ensure!(
+        command.status()?.success(),
+        "Hub restart failed; registration is saved. Start the hub after correcting the startup error"
+    );
+    Ok(())
+}

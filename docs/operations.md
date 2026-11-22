@@ -59,7 +59,8 @@ TLS needs a reasonably accurate clock; monitoring intervals do not need synchron
 ## Registration and monitoring
 
 `register NAME` exports `NAME.toml` (0600); `--output PATH` changes the destination and refuses overwrites.
-The private registry is stored beside the hub database. Restart after registration, then transfer the profile securely.
+The private registry is stored beside the hub database. Registration automatically restarts a running `hub -d` daemon and preserves its working directory. Transfer the profile securely.
+Stopped hubs stay stopped. Foreground and systemd hubs print a reminder to restart using their existing process manager.
 `unregister NAME` revokes credentials immediately, removes the live policy/pending alerts within one second,
 and preserves history and exported files. Explicit `[[agents]]` entries must be removed from the config, followed by restart.
 Re-registering creates a new credential: replace the agent profile as well.

@@ -179,8 +179,10 @@ async fn execute(cli: Cli) -> Result<()> {
                 file.write_all(&std::fs::read(&path)?)?;
                 file.sync_all()?;
                 telegraff::utils::message(&format!("Registered {name}: {}", output.display()), 32);
-                println!("Copy {} to the agent; restart the hub.", output.display());
+                println!("Copy {} to the agent.", output.display());
             }
+            telegraff::infrastructure::process::restart_hub_if_running(&config)
+                .context("Agent profile saved, but hub restart did not complete")?;
             if cli.verbose {
                 println!(
                     "Profile contains a private credential (0600); no separate key is needed."

@@ -194,6 +194,15 @@ fn daemon_lifecycle_and_exported_profile() {
     let mut stop = Command::new(BIN);
     stop.args(["down", "--config"]).arg(&config);
     // Always stop the child before asserting the duplicate-start outcome.
+    let registered_live = Command::new(BIN)
+        .args(["register", "live-agent", "--config"])
+        .arg(&config)
+        .arg("--output")
+        .arg(dir.path().join("live-agent.toml"))
+        .output()
+        .unwrap();
+    let live_enrolled = SqliteStore::read(&dir.path().join("state.sqlite"))
+        .is_ok_and(|state| state.enrolled.contains_key("live-agent"));
     let agent_started = Command::new(BIN)
         .args(["agent", "-d", "--config"])
         .arg(&export)
@@ -206,6 +215,12 @@ fn daemon_lifecycle_and_exported_profile() {
         .unwrap();
     let duplicate = start();
     let stopped = stop.output().unwrap();
+    assert!(
+        registered_live.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered_live.stderr)
+    );
+    assert!(live_enrolled, "registration must reach the restarted hub");
     assert!(agent_started.status.success());
     assert!(agent_stopped.status.success());
     assert!(!duplicate.status.success());
