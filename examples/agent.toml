@@ -1,0 +1,16 @@
+mode = "agent"
+hub = "hub.example.net"
+port = 9477
+timeout_seconds = 120
+udp_bytes_per_second = 131072
+
+[agent]
+name = "node-01"
+key_file = "/etc/telegraff/node-01.key"
+activation = 0
+interval = 3600
+offset = 0
+grace = 600
+families = ["ipv4", "ipv6"]
+payload_bytes = 153600
+udp_threshold = 99

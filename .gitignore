@@ -1,0 +1,4 @@
+/target/
+*.sqlite*
+*.key
+SPEC.md

@@ -1,0 +1,12 @@
+[Unit]
+Description=telegraff hourly transfer schedule
+
+[Timer]
+OnCalendar=*-*-* *:00:00 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=telegraff-agent.service
+
+[Install]
+WantedBy=timers.target

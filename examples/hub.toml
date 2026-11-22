@@ -1,0 +1,24 @@
+mode = "hub"
+database = "/var/lib/telegraff/state.sqlite"
+target = "hub.example.net"
+tcp_listen = ["0.0.0.0:9477", "[::]:9477"]
+udp_listen = ["0.0.0.0:9477", "[::]:9477"]
+retention_days = 30
+reminder_seconds = 21600
+max_connections = 64
+max_assemblies = 256
+
+[ntfy]
+endpoint = "https://ntfy.example.net/telegraff"
+token_file = "/etc/telegraff/ntfy.token"
+
+[[agents]]
+name = "node-01"
+key_file = "/etc/telegraff/node-01.key"
+activation = 0
+interval = 3600
+offset = 0
+grace = 600
+families = ["ipv4", "ipv6"]
+payload_bytes = 153600
+udp_threshold = 99
