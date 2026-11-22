@@ -31,7 +31,7 @@ fn example_configuration_runs_a_hub_and_agent() {
         )
         .replace("hub.example.net", "127.0.0.1")
         .replace(
-            "[\"0.0.0.0:9477\", \"[::]:9477\"]",
+            "[\"127.0.0.1:9477\", \"[::1]:9477\"]",
             &format!("[\"127.0.0.1:{port}\"]"),
         );
     std::fs::write(&hub_file, hub).unwrap();

@@ -36,7 +36,7 @@ SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
 
 2. Edit `/etc/telegraff/hub.toml`. Replace `hub.example.net` with the hub DNS name or IP literal. Set `target` to the address agents use. Set `ntfy.endpoint` to the HTTPS topic URL and subscribe to that topic in ntfy. The URL is sufficient for topics that allow anonymous publishing. For a topic that requires authentication, uncomment `token_file` and save the ntfy access token in that file (owner `telegraff`, mode `0600`). For a local trial without notifications, remove the `[ntfy]` table.
 
-3. Allow inbound TCP **and** UDP port `9477` in the host and provider firewalls for each configured address family. Agents need outbound access to that port. The hub needs DNS and HTTPS access to ntfy. Remove IPv6 listener entries only if the hub has no IPv6 support.
+3. Keep hub TCP and UDP listeners on loopback (`127.0.0.1` and `::1`); setup and the example use these addresses. nginx on the same host forwards traffic to that private backend. Open only nginx's public TCP/UDP port in the host and provider firewalls; do not expose the internal hub port. Agents need outbound access to the public port. The hub needs DNS and HTTPS access to ntfy. Remove the `::1` listeners only if IPv6 is unavailable locally. Existing configurations are not rewritten automatically: replace `0.0.0.0` with `127.0.0.1` and `[::]` with `[::1]`, then restart the hub.
 
 4. Start the hub:
 

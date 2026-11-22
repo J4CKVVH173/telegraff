@@ -78,8 +78,8 @@ pub fn run() -> Result<()> {
             table.insert(
                 k.into(),
                 toml::Value::Array(vec![
-                    toml::Value::String(format!("0.0.0.0:{listen}")),
-                    toml::Value::String(format!("[::]:{listen}")),
+                    toml::Value::String(format!("127.0.0.1:{listen}")),
+                    toml::Value::String(format!("[::1]:{listen}")),
                 ]),
             );
         }
