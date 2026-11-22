@@ -112,32 +112,53 @@ impl Status {
 impl Status {
     /// Operator summary; machine-readable details remain available through --json.
     pub fn human(&self, now: u64) -> String {
+        self.human_with_color(now, false)
+    }
+    pub fn human_with_color(&self, now: u64, color: bool) -> String {
+        use crate::utils::paint;
         use std::fmt::Write;
         let mut out = String::new();
         if self.last_observation == 0 {
             writeln!(
                 out,
-                "Hub: no observations yet. Start the hub to begin monitoring."
+                "{}",
+                paint(
+                    "Hub: no observations yet. Start the hub to begin monitoring.",
+                    33,
+                    color
+                )
             )
             .unwrap();
         } else if self.last_observation > now {
             writeln!(
                 out,
-                "Hub: observation timestamp is in the future; check the system clock."
+                "{}",
+                paint(
+                    "Hub: observation timestamp is in the future; check the system clock.",
+                    33,
+                    color
+                )
             )
             .unwrap();
         } else if now - self.last_observation > 10 {
-            writeln!(out, "Hub: no recent heartbeat (last observed {}). Data may be stale; check whether the hub is running.", ago(self.last_observation, now)).unwrap();
+            writeln!(
+                out,
+                "{} (last observed {}). Data may be stale; check whether the hub is running.",
+                paint("Hub: no recent heartbeat", 33, color),
+                ago(self.last_observation, now)
+            )
+            .unwrap();
         } else {
             writeln!(
                 out,
-                "Hub: recent heartbeat (observed {}).",
+                "{} (observed {}).",
+                paint("Hub: recent heartbeat", 32, color),
                 ago(self.last_observation, now)
             )
             .unwrap();
         }
         if self.agents.is_empty() {
-            writeln!(out, "No agents configured: no servers are being monitored.\nRun telegraff register NAME on the hub, copy NAME.toml to the agent, start the agent, and restart the hub to load the registration.").unwrap();
+            writeln!(out, "{}: no servers are being monitored.\nRun telegraff register NAME on the hub, copy NAME.toml to the agent, start the agent, and restart the hub to load the registration.", paint("No agents configured", 31, color)).unwrap();
         } else {
             writeln!(
                 out,
@@ -147,7 +168,13 @@ impl Status {
             .unwrap();
         }
         for agent in &self.agents {
-            writeln!(out, "{}: {}", agent.name, meaning(&agent.overall)).unwrap();
+            writeln!(
+                out,
+                "{}: {}",
+                agent.name,
+                colored_meaning(&agent.overall, color)
+            )
+            .unwrap();
             if agent.enrollment_failures > 0 {
                 writeln!(out, "  Address-family enrollment failed for {} interval(s); check hub DNS and restart after correcting it.", agent.enrollment_failures).unwrap();
             }
@@ -156,9 +183,9 @@ impl Status {
                     continue;
                 }
                 let label = if channel.state == "PENDING" && channel.accepted_bytes > 0 {
-                    "data received; interval result pending"
+                    paint("data received; interval result pending", 33, color)
                 } else {
-                    meaning(&channel.state)
+                    colored_meaning(&channel.state, color)
                 };
                 write!(out, "  {}: {}", channel.channel, label).unwrap();
                 if channel.failures > 0 {
@@ -177,21 +204,42 @@ impl Status {
         {
             writeln!(
                 out,
-                "DNS warning: one or more lookups failed; see status --json for details."
+                "{}",
+                paint(
+                    "DNS warning: one or more lookups failed; see status --json for details.",
+                    33,
+                    color
+                )
             )
             .unwrap();
         }
         writeln!(
             out,
             "Notifications waiting to be sent: {}",
-            self.queued_notifications
+            paint(
+                &self.queued_notifications.to_string(),
+                if self.queued_notifications == 0 {
+                    32
+                } else {
+                    33
+                },
+                color
+            )
         )
         .unwrap();
         if let Some(&(start, end)) = self.observation_gaps.last() {
-            writeln!(out, "Monitoring history: last interruption lasted {}s (ended {}); {} recorded interruption(s). No observations were recorded during that time, so network health was unknown. This is a monitoring interruption, not proof of a network failure.", end.saturating_sub(start), ago(end, now), self.observation_gaps.len()).unwrap();
+            writeln!(out, "{}: last interruption lasted {}s (ended {}); {} recorded interruption(s). No observations were recorded during that time, so network health was unknown. This is a monitoring interruption, not proof of a network failure.", paint("Monitoring history", 33, color), end.saturating_sub(start), ago(end, now), self.observation_gaps.len()).unwrap();
         }
         out
     }
+}
+fn colored_meaning(state: &str, color: bool) -> String {
+    let code = match state {
+        "OK" => 32,
+        "DEGRADED" | "MISSING" | "ALERT" | "FAILING" => 31,
+        _ => 33,
+    };
+    crate::utils::paint(meaning(state), code, color)
 }
 fn ago(time: u64, now: u64) -> String {
     if time > now {
@@ -236,5 +284,11 @@ mod human_tests {
         assert!(text.contains("84s"));
         assert!(text.contains("not proof of a network failure"));
         assert!(!text.contains("dns_set="));
+        assert!(!text.contains('\x1b'));
+        let colored = Status::new(&state, &[]).human_with_color(200, true);
+        assert!(colored.contains("\x1b[31mNo agents configured\x1b[0m"));
+        assert!(colored.contains("\x1b[33mHub: no recent heartbeat\x1b[0m"));
+        let fresh = Status::new(&state, &[]).human_with_color(101, true);
+        assert!(fresh.contains("\x1b[32mHub: recent heartbeat\x1b[0m"));
     }
 }

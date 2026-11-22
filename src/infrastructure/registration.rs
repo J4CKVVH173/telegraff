@@ -57,6 +57,32 @@ fn directory(hub: &HubConfig) -> PathBuf {
     hub.database.with_added_extension("agents.d")
 }
 
+pub(super) fn is_registered(hub: &HubConfig, entry: &AgentEntry) -> bool {
+    entry.key_file == directory(hub).join(format!("{}.profile", entry.name))
+}
+
+pub fn unregister(hub: &HubConfig, name: &str) -> Result<()> {
+    validate_name(name)?;
+    let entry = hub
+        .agents
+        .iter()
+        .find(|a| a.name == name)
+        .context("Agent is not registered")?;
+    ensure!(
+        is_registered(hub, entry),
+        "Agent is an explicit [[agents]] configuration entry; remove that entry from the hub config and restart the hub"
+    );
+    ensure!(
+        !hub.agents
+            .iter()
+            .any(|a| a.name != name && a.key_file == entry.key_file),
+        "Another agent uses this credential file; refusing to remove it"
+    );
+    fs::remove_file(&entry.key_file).context("Cannot remove agent registration")?;
+    fs::File::open(directory(hub))?.sync_all()?;
+    Ok(())
+}
+
 pub(super) fn load_registry(hub: &mut HubConfig) -> Result<()> {
     let files = match fs::read_dir(directory(hub)) {
         Ok(files) => files,

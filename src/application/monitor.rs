@@ -7,6 +7,23 @@ pub struct Monitor {
     pub retention: u64,
 }
 impl Monitor {
+    pub fn forget(&mut self, name: &str) {
+        self.policies.retain(|p| p.name != name);
+        self.state.channels.remove(name);
+        self.state.enrolled.remove(name);
+        self.state.enrollment_failures.remove(name);
+        self.state.cycle_anchors.remove(name);
+        self.state.cycle_tokens.remove(name);
+        for key in [
+            name.to_owned(),
+            format!("agent:{name}"),
+            format!("view:{name}"),
+            format!("enrollment:{name}"),
+        ] {
+            self.state.dns.remove(&key);
+        }
+        self.state.outbox.retain(|n| n.agent != name);
+    }
     pub fn accept(&mut self, mut result: Transfer, now: u64) -> bool {
         let Some(policy) = self.policies.iter().find(|p| p.name == result.agent) else {
             return false;

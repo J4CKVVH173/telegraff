@@ -241,3 +241,177 @@ fn status_uses_default_config_and_explains_empty_monitoring() {
     let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert!(value["agents"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn down_handles_atomic_binary_upgrade_but_rejects_other_executable_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("telegraff");
+    std::fs::copy(BIN, &binary).unwrap();
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let config = dir.path().join("hub.toml");
+    std::fs::write(&config,format!("mode='hub'\ndatabase='{}'\ntarget='127.0.0.1'\ntcp_listen=['127.0.0.1:{port}']\nudp_listen=['127.0.0.1:{port}']\n",dir.path().join("state.sqlite").display())).unwrap();
+    assert!(
+        Command::new(&binary)
+            .args(["hub", "-d", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let other = Command::new(BIN)
+        .args(["down", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    let replacement = dir.path().join("telegraff.new");
+    std::fs::copy(BIN, &replacement).unwrap();
+    std::fs::rename(&replacement, &binary).unwrap();
+    let stopped = Command::new(&binary)
+        .args(["down", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(!other.status.success());
+    assert!(String::from_utf8_lossy(&other.stderr).contains("Process executable differs"));
+}
+
+#[test]
+fn unregister_revokes_live_access_preserves_other_agents_and_rejects_old_key_after_reregistration()
+{
+    use std::io::{Read, Write};
+    use telegraff::{
+        application::{Channel, Family, Protocol},
+        infrastructure::{
+            config::read_key,
+            wire::{DATA, Frame},
+        },
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.sqlite");
+    let config = dir.path().join("telegraff.toml");
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    std::fs::write(&config,format!("mode='hub'\ndatabase='{}'\ntarget='127.0.0.1'\ntcp_listen=['127.0.0.1:{port}']\nudp_listen=['127.0.0.1:{port}']\n",database.display())).unwrap();
+    for name in ["removed", "keeper"] {
+        assert!(
+            Command::new(BIN)
+                .current_dir(dir.path())
+                .args(["register", name])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let keeper_path = dir.path().join("keeper.toml");
+    let keeper_profile = std::fs::read(&keeper_path).unwrap();
+    let old_key = read_key(&dir.path().join("removed.toml")).unwrap();
+    let keeper_key = read_key(&keeper_path).unwrap();
+    let mut hub = Hub(Command::new(BIN)
+        .current_dir(dir.path())
+        .arg("hub")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap());
+    for _ in 0..100 {
+        if SqliteStore::read(&database).is_ok_and(|s| s.enrolled.len() == 2) {
+            break;
+        }
+        assert!(hub.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(SqliteStore::read(&database).unwrap().enrolled.len(), 2);
+    let exchange = |name: &str, key: &[u8]| {
+        let frame = Frame {
+            kind: DATA,
+            agent: name.into(),
+            cycle: 123456,
+            channel: Channel {
+                family: Family::Ipv4,
+                protocol: Protocol::Tcp,
+            },
+            transfer: 0,
+            total: 153600,
+            part: 0,
+            parts: 1,
+            payload: vec![1; 153600],
+        };
+        let bytes = frame.encode(key);
+        let mut stream =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let written = stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .and_then(|_| stream.write_all(&bytes));
+        if written.is_err() {
+            return false;
+        }
+        let mut length = [0; 4];
+        if stream.read_exact(&mut length).is_err() {
+            return false;
+        }
+        let mut response = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut response).unwrap();
+        frame.matches_receipt(&Frame::decode(&response, key).unwrap())
+    };
+    assert!(exchange("removed", &old_key));
+    for name in ["unknown", "../keeper"] {
+        assert!(
+            !Command::new(BIN)
+                .current_dir(dir.path())
+                .args(["unregister", name])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    assert!(
+        Command::new(BIN)
+            .current_dir(dir.path())
+            .args(["unregister", "removed"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!exchange("removed", &old_key));
+    assert!(exchange("keeper", &keeper_key));
+    for _ in 0..100 {
+        if !SqliteStore::read(&database)
+            .unwrap()
+            .enrolled
+            .contains_key("removed")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let state = SqliteStore::read(&database).unwrap();
+    assert!(!state.enrolled.contains_key("removed"));
+    assert!(state.enrolled.contains_key("keeper"));
+    assert!(hub.0.try_wait().unwrap().is_none());
+    assert_eq!(keeper_profile, std::fs::read(&keeper_path).unwrap());
+    assert!(
+        Command::new(BIN)
+            .current_dir(dir.path())
+            .args(["register", "removed", "--output", "fresh.toml"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!exchange("removed", &old_key));
+}

@@ -19,7 +19,7 @@ use tokio::{
     time::timeout,
 };
 
-pub async fn run(config: HubConfig, resolver: &impl Resolver) -> Result<()> {
+pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> {
     let registry = receiver::registry(&config.agents)?;
     let mut store = SqliteStore::open(&config.database)?;
     let mut state = store.load()?;
@@ -48,6 +48,25 @@ pub async fn run(config: HubConfig, resolver: &impl Resolver) -> Result<()> {
         reminder: config.reminder_seconds,
         retention: config.retention_days * 86400,
     };
+    let stale = monitor
+        .state
+        .channels
+        .keys()
+        .chain(monitor.state.enrolled.keys())
+        .cloned()
+        .chain(
+            monitor
+                .state
+                .outbox
+                .iter()
+                .filter(|n| n.agent != "hub")
+                .map(|n| n.agent.clone()),
+        )
+        .filter(|name| !config.agents.iter().any(|a| &a.name == name))
+        .collect::<std::collections::HashSet<_>>();
+    for name in stale {
+        monitor.forget(&name);
+    }
     monitor.restart(unix_time());
     store.save(&monitor.state)?;
     let (tx, mut rx) = mpsc::channel::<Intake>(256);
@@ -126,6 +145,9 @@ pub async fn run(config: HubConfig, resolver: &impl Resolver) -> Result<()> {
             }
             _ = tick.tick() => {
                 let now = unix_time();
+                let removed = config.agents.iter().filter(|a| super::registration::is_registered(&config, a) && !a.key_file.exists()).map(|a| a.name.clone()).collect::<Vec<_>>();
+                for name in &removed { monitor.forget(name); }
+                config.agents.retain(|a| !removed.contains(&a.name));
                 monitor.tick(now);
                 store.save(&monitor.state)?;
                 if has_notifier && !in_flight && let Some(n) = monitor.state.notification_due(now) {
@@ -135,8 +157,14 @@ pub async fn run(config: HubConfig, resolver: &impl Resolver) -> Result<()> {
             }
             Some((id,ok)) = outcome_rx.recv() => {
                 in_flight = false;
-                ensure!(monitor.state.complete_notification(id,ok,unix_time()), "Notification order mismatch");
-                if !ok { eprintln!("Notification delivery failed; retry scheduled"); }
+                if monitor.state.outbox.first().is_some_and(|n| n.id == id) {
+                    ensure!(monitor.state.complete_notification(id,ok,unix_time()), "Notification order mismatch");
+                    if !ok { eprintln!("Notification delivery failed; retry scheduled"); }
+                } else {
+                    // unregister may cancel this notification while delivery is
+                    // in flight. An already dispatched request cannot be recalled.
+                    ensure!(!monitor.state.outbox.iter().any(|n| n.id == id), "Notification order mismatch");
+                }
                 store.save(&monitor.state)?;
             }
             _ = dns_tick.tick(), if !resolving => {

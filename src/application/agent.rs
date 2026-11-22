@@ -218,3 +218,104 @@ pub async fn run(
     }
     Ok(report)
 }
+
+impl AgentReport {
+    pub fn human(&self, color: bool) -> String {
+        use crate::utils::paint;
+        use std::fmt::Write;
+        let mut out = String::new();
+        let (summary, code) = if self.successful() {
+            ("PASS: all expected channels confirmed delivery", 32)
+        } else {
+            (
+                "FAIL: delivery was not confirmed for every expected channel",
+                31,
+            )
+        };
+        writeln!(out, "{}: {}", self.agent, paint(summary, code, color)).unwrap();
+        for channel in &self.channels {
+            let success = channel.accepted == Some(true) && channel.receipt_received;
+            let label = if success {
+                "PASS"
+            } else {
+                "FAIL: no successful receipt"
+            };
+            let transfers = channel
+                .transfers
+                .iter()
+                .filter(|attempt| attempt.receipt_received)
+                .count();
+            writeln!(
+                out,
+                "  {}: {}{}; receipts {}/{}; max accepted {} bytes",
+                channel.channel,
+                paint(label, if success { 32 } else { 31 }, color),
+                if channel.expected {
+                    ""
+                } else {
+                    " (additional channel; not required)"
+                },
+                transfers,
+                channel.transfers.len(),
+                channel.accepted_bytes
+            )
+            .unwrap();
+            if !success
+                && let Some(error) = channel
+                    .transfers
+                    .iter()
+                    .rev()
+                    .find_map(|attempt| attempt.error.as_deref())
+            {
+                writeln!(out, "    {}", paint(error, 31, color)).unwrap();
+            }
+        }
+        if self.channels.is_empty() {
+            writeln!(
+                out,
+                "No target channels available; check hub DNS and configured address families."
+            )
+            .unwrap();
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod human_tests {
+    use super::*;
+    #[test]
+    fn summary_distinguishes_optional_failures_and_keeps_plain_labels() {
+        let report = AgentReport {
+            agent: "node-test".into(),
+            cycle: 1,
+            dns: String::new(),
+            channels: vec![
+                ChannelReport {
+                    channel: "ipv4/tcp".into(),
+                    expected: true,
+                    accepted: Some(true),
+                    receipt_received: true,
+                    accepted_bytes: 153600,
+                    transfers: vec![],
+                },
+                ChannelReport {
+                    channel: "ipv6/tcp".into(),
+                    expected: false,
+                    accepted: None,
+                    receipt_received: false,
+                    accepted_bytes: 0,
+                    transfers: vec![],
+                },
+            ],
+        };
+        let plain = report.human(false);
+        assert!(plain.contains("PASS: all expected channels"));
+        assert!(plain.contains("additional channel; not required"));
+        assert!(plain.contains("FAIL: no successful receipt"));
+        assert!(!plain.contains('\x1b'));
+        let colored = report.human(true);
+        assert!(colored.contains("\x1b[32mPASS"));
+        assert!(colored.contains("\x1b[31mFAIL"));
+    }
+}

@@ -99,8 +99,14 @@ pub fn down(config: &Path) -> Result<()> {
     let pid: u32 = text.trim().parse().context("Invalid process record")?;
     ensure!(pid > 1, "Invalid process identifier");
     let executable = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    // Atomic binary upgrades unlink the old inode while its process keeps
+    // running. Linux appends this marker to /proc/PID/exe in that case.
+    let executable_bytes = executable.as_os_str().as_encoded_bytes();
+    let executable_path = executable_bytes
+        .strip_suffix(b" (deleted)")
+        .unwrap_or(executable_bytes);
     ensure!(
-        executable == std::env::current_exe()?,
+        executable_path == std::env::current_exe()?.as_os_str().as_encoded_bytes(),
         "Process executable differs; refusing to signal"
     );
     let args = std::fs::read(format!("/proc/{pid}/cmdline"))?;

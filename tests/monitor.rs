@@ -149,3 +149,21 @@ fn continuous_cycles_use_hub_time_and_reject_replays_after_restart() {
     assert!(m.accept(transfer(7, Ipv4, Tcp, 153600), 3800));
     assert_eq!(m.state.transfers.last().unwrap().cycle, 3723);
 }
+
+#[test]
+fn forgetting_an_agent_cancels_its_alerts_and_preserves_history_and_other_agents() {
+    let mut m = monitor();
+    m.state.enrolled.insert("node-01".into(), vec![Ipv4]);
+    m.state.enrolled.insert("keeper".into(), vec![Ipv4]);
+    m.state
+        .enqueue("node-01", 100, "removed agent alert".into());
+    m.state.enqueue("keeper", 100, "keep this alert".into());
+    m.state.transfers.push(transfer(0, Ipv4, Tcp, 153600));
+    m.forget("node-01");
+    assert!(m.policies.is_empty());
+    assert!(!m.state.enrolled.contains_key("node-01"));
+    assert!(m.state.enrolled.contains_key("keeper"));
+    assert_eq!(m.state.outbox.len(), 1);
+    assert_eq!(m.state.outbox[0].agent, "keeper");
+    assert_eq!(m.state.transfers.len(), 1);
+}

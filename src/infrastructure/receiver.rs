@@ -119,6 +119,11 @@ fn authenticate(
     let credential = registry
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("Unknown agent"))?;
+    // Removal and key rotation revoke cached credentials before any new intake.
+    ensure!(
+        read_key(&credential.entry.key_file).is_ok_and(|key| key == credential.key),
+        "Agent credential revoked or changed"
+    );
     let frame = Frame::decode(bytes, &credential.key)?;
     ensure!(
         (frame.kind == DATA || (frame.kind == super::wire::IDENTITY && protocol == Protocol::Tcp))

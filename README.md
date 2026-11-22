@@ -62,6 +62,8 @@ For agent setup, first copy `NAME.toml` exported by `register` from the hub to t
 
 Transfer `node-01.toml` securely to the agent and keep mode 0600. This **is the complete agent configuration**, including its secret. There is no separate key file, and no need to also keep a copy in `/etc`. By default `register NAME` exports `NAME.toml` in the current directory; `--output` chooses another path. The registration stays in the hub's private registry beside the SQLite database; restart the hub after registration. The secret is never printed to the terminal. `--output` refuses to overwrite an existing file.
 
+Remove an agent on the hub with `./telegraff unregister NAME` (or add `--config PATH`). New requests using its credential are rejected immediately; the running hub drops its monitoring policy and pending notifications within one second without restarting. Historical transfers and exported configuration files are retained. An explicit `[[agents]]` entry must instead be removed from the TOML and the hub restarted. Re-registering a name creates a new key: transfer the new profile and restart the hub as for a new registration.
+
 ```sh
 ./telegraff agent --config node-01.toml -d
 ./telegraff down --config node-01.toml
@@ -69,7 +71,13 @@ Transfer `node-01.toml` securely to the agent and keep mode 0600. This **is the 
 ./telegraff agent --config node-01.toml --once
 ```
 
+To verify a new setup immediately, run `./telegraff agent --once` on the agent (with the default configuration) and `./telegraff status` on the hub. A background agent already owns the configuration: stop it with `./telegraff down` before a manual cycle, then start it again with `./telegraff agent -d`. A successful agent cycle says `PASS` for every expected channel; failures show `FAIL` and any connection/certificate error. Hub interval results may still be pending until the interval closes. A recent hub heartbeat alone does not prove probe success.
+
+Terminal summaries use green for successful results, yellow for waiting/warnings, and red for failures. Labels remain readable without color. Set `NO_COLOR=1` or `TERM=dumb` to disable colors. Redirected output and JSON contain no color escapes. Agent output stays JSON when redirected; `agent --json` explicitly requests JSON in a terminal. Status details remain available with `status --json`.
+
 Agent foreground mode now stays running, checks access immediately, and repeats after the configured interval. Failures are reported and retried. `-d` detaches from the terminal using Linux `setsid`; it does not enable boot startup. Runtime PID and log files live in a private per-user temporary directory; the start command prints the log path. Stop with the same user and configuration path. Do not combine `-d` with systemd. For boot startup, enable `telegraff-agent.service` directly; disable the old agent timer first.
+
+When updating, copy the new executable under a temporary filename and rename it over `telegraff` after the copy completes. Do not overwrite a running executable in place. `down` supports stopping the previous version after this atomic replacement when the executable path, user and configuration stay the same. Restart the hub after registration to load new agents.
 
 Registered profiles run immediately without a scheduled window. The hub assigns incoming cycles to its own interval timeline, anchored when it first loads the registration; agent clocks do not have to match the hub clock. Cycle tokens and interval anchors are persisted, so a previously accepted token cannot count again in a later interval after restart. Upgrade and restart both hub and agent, including for existing profiles. Handwritten legacy `mode = "agent"` configurations retain their explicit scheduling policy; `grace = interval` selects continuous mode on both sides.
 
@@ -81,6 +89,7 @@ nginx may terminate TLS and forward HTTP to the hub's existing TCP listener. For
 
 ```nginx
 location = /telegraff {
+    if ($request_method != POST) { return 405; }
     client_max_body_size 256k;
     proxy_pass http://127.0.0.1:19477;
     proxy_http_version 1.1;

@@ -1,6 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
+use std::{
+    fs::OpenOptions,
+    io::{IsTerminal, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+};
 use telegraff::infrastructure::{
     agent::SocketTransport, config::Config, dns::Dns, hub, store::SqliteStore,
 };
@@ -33,6 +38,12 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Remove a registered agent and revoke its credential.
+    Unregister {
+        name: String,
+        #[arg(long, default_value = "telegraff.toml")]
+        config: PathBuf,
+    },
     Hub {
         #[arg(long, default_value = "telegraff.toml")]
         config: PathBuf,
@@ -47,6 +58,9 @@ enum Command {
         /// Perform a single diagnostic cycle.
         #[arg(long)]
         once: bool,
+        /// Emit the detailed machine-readable report even in a terminal.
+        #[arg(long)]
+        json: bool,
     },
     Config {
         #[command(subcommand)]
@@ -81,7 +95,14 @@ enum KeyCommand {
 #[tokio::main]
 async fn main() {
     if let Err(e) = execute(Cli::parse()).await {
-        eprintln!("Error: {e}");
+        eprintln!(
+            "{}",
+            telegraff::utils::paint(
+                &format!("Error: {e}"),
+                31,
+                telegraff::utils::color_enabled(std::io::stderr().is_terminal())
+            )
+        );
         std::process::exit(1);
     }
 }
@@ -98,12 +119,22 @@ async fn execute(cli: Cli) -> Result<()> {
                     config: "telegraff.toml".into(),
                     daemon: false,
                     once: false,
+                    json: false,
                 },
             }
         }
         None => Command::Setup,
     };
     match command {
+        Command::Unregister { name, config } => {
+            let Config::Hub(hub) = Config::load(&config)? else {
+                anyhow::bail!("Hub configuration required");
+            };
+            telegraff::infrastructure::registration::unregister(&hub, &name)?;
+            println!(
+                "Removed {name}. New requests are revoked immediately; the running hub removes its monitoring policy within one second. Historical transfers are retained. The exported agent configuration is not deleted."
+            );
+        }
         Command::Setup => telegraff::infrastructure::setup::run()?,
         Command::Down { config } => telegraff::infrastructure::process::down(&config)?,
         Command::Register {
@@ -157,6 +188,7 @@ async fn execute(cli: Cli) -> Result<()> {
             config,
             daemon,
             once,
+            json,
         } => {
             if daemon {
                 return telegraff::infrastructure::process::start("agent", &config);
@@ -200,7 +232,14 @@ async fn execute(cli: Cli) -> Result<()> {
                     Ok(report) => report,
                     Err(e) if once => return Err(e),
                     Err(e) => {
-                        eprintln!("Cycle failed: {e}; will retry after interval");
+                        eprintln!(
+                            "{}",
+                            telegraff::utils::paint(
+                                &format!("Cycle failed: {e}; will retry after interval"),
+                                31,
+                                telegraff::utils::color_enabled(std::io::stderr().is_terminal())
+                            )
+                        );
                         tokio::select! {
                             _ = tokio::time::sleep(std::time::Duration::from_secs(settings.policy.interval)) => continue,
                             _ = tokio::signal::ctrl_c() => break,
@@ -208,7 +247,11 @@ async fn execute(cli: Cli) -> Result<()> {
                         }
                     }
                 };
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                if json || !std::io::stdout().is_terminal() {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", report.human(telegraff::utils::color_enabled(true)));
+                }
                 if once {
                     ensure!(
                         report.successful(),
@@ -217,7 +260,14 @@ async fn execute(cli: Cli) -> Result<()> {
                     break;
                 }
                 if !report.successful() {
-                    eprintln!("Access check failed for one or more channels; retry scheduled");
+                    eprintln!(
+                        "{}",
+                        telegraff::utils::paint(
+                            "Access check failed for one or more channels; retry scheduled",
+                            31,
+                            telegraff::utils::color_enabled(std::io::stderr().is_terminal())
+                        )
+                    );
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(settings.policy.interval)) => {},
@@ -230,7 +280,14 @@ async fn execute(cli: Cli) -> Result<()> {
             command: ConfigCommand::Check { config },
         } => {
             Config::load(&config)?;
-            println!("Configuration valid");
+            println!(
+                "{}",
+                telegraff::utils::paint(
+                    "Configuration valid",
+                    32,
+                    telegraff::utils::color_enabled(std::io::stdout().is_terminal())
+                )
+            );
         }
         Command::Key {
             command: KeyCommand::Generate { output },
@@ -267,7 +324,13 @@ async fn execute(cli: Cli) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                print!("{}", status.human(telegraff::utils::unix_time()));
+                print!(
+                    "{}",
+                    status.human_with_color(
+                        telegraff::utils::unix_time(),
+                        telegraff::utils::color_enabled(std::io::stdout().is_terminal())
+                    )
+                );
             }
         }
     }
