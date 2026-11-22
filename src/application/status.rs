@@ -16,6 +16,8 @@ pub struct AgentStatus {
     pub overall: String,
     pub enrollment_failures: u32,
     pub channels: Vec<ChannelStatus>,
+    pub interval_seconds: u64,
+    pub next_result_at: Option<u64>,
 }
 #[derive(Serialize)]
 pub struct ChannelStatus {
@@ -87,7 +89,36 @@ impl Status {
                 } else {
                     "PENDING"
                 };
+                let mut schedule = p.clone();
+                if p.grace == p.interval
+                    && let Some(&anchor) = state.cycle_anchors.get(&p.name)
+                {
+                    schedule.activation = anchor;
+                    schedule.offset = anchor % schedule.interval;
+                }
+                let next_result_at = (!p.paused)
+                    .then(|| {
+                        p.channels()
+                            .iter()
+                            .map(|channel| {
+                                let finalized = state
+                                    .channels
+                                    .get(&p.name)
+                                    .and_then(|channels| channels.get(&channel.label()))
+                                    .and_then(|saved| saved.last_finalized);
+                                finalized
+                                    .map_or_else(
+                                        || schedule.first_cycle(),
+                                        |cycle| cycle.saturating_add(p.interval),
+                                    )
+                                    .saturating_add(p.grace)
+                            })
+                            .min()
+                    })
+                    .flatten();
                 AgentStatus {
+                    interval_seconds: p.interval,
+                    next_result_at,
                     name: p.name.clone(),
                     overall: overall.into(),
                     enrollment_failures: state
@@ -110,16 +141,21 @@ impl Status {
 }
 
 impl Status {
-    /// Operator summary; machine-readable details remain available through --json.
     pub fn human(&self, now: u64) -> String {
         self.human_with_color(now, false)
     }
     pub fn human_with_color(&self, now: u64, color: bool) -> String {
-        use crate::utils::paint;
+        self.render(now, color, false)
+    }
+    pub fn verbose_with_color(&self, now: u64, color: bool) -> String {
+        self.render(now, color, true)
+    }
+    fn render(&self, now: u64, color: bool, verbose: bool) -> String {
+        use crate::utils::{duration, paint, timestamp};
         use std::fmt::Write;
         let mut out = String::new();
         let (label, code) = if self.last_observation == 0 {
-            ("WAIT", 33)
+            ("NO UPDATES", 33)
         } else if self.last_observation > now {
             ("CLOCK ERROR", 31)
         } else if now - self.last_observation > 10 {
@@ -129,7 +165,12 @@ impl Status {
         };
         write!(out, "Hub: {}", paint(label, code, color)).unwrap();
         if self.last_observation > 0 {
-            write!(out, " (heartbeat {})", ago(self.last_observation, now)).unwrap();
+            write!(
+                out,
+                " (hub state updated {})",
+                ago(self.last_observation, now)
+            )
+            .unwrap();
         }
         writeln!(out).unwrap();
         if self.agents.is_empty() {
@@ -141,305 +182,328 @@ impl Status {
             .unwrap();
         }
         for agent in &self.agents {
+            let expected: Vec<_> = agent.channels.iter().filter(|c| c.expected).collect();
+            let received = expected.iter().filter(|c| c.accepted_bytes > 0).count();
+            let summary = if agent.overall == "PENDING" {
+                if expected.is_empty() {
+                    "NO DATA (awaiting enrollment)".to_owned()
+                } else {
+                    format!("{received}/{} channels received", expected.len())
+                }
+            } else {
+                short_state(&agent.overall).to_owned()
+            };
             write!(
                 out,
-                "{}: {}",
+                "{}: {}{}",
                 agent.name,
-                short_state(&agent.overall, color)
+                paint(&summary, state_color(&agent.overall), color),
+                if verbose {
+                    format!("; interval {}", duration(agent.interval_seconds))
+                } else {
+                    String::new()
+                }
             )
             .unwrap();
-            for channel in &agent.channels {
-                if !channel.expected && channel.state != "UNENROLLED" {
-                    continue;
+            if verbose {
+                writeln!(out).unwrap();
+                for channel in &agent.channels {
+                    if !channel.expected && channel.state != "UNENROLLED" {
+                        continue;
+                    }
+                    write!(
+                        out,
+                        "  {}: {}",
+                        channel.channel,
+                        channel_label(channel, color)
+                    )
+                    .unwrap();
+                    if channel.accepted_bytes > 0 {
+                        write!(out, "; {} KiB received", channel.accepted_bytes / 1024).unwrap();
+                    }
+                    if let Some(time) = channel.last_success {
+                        write!(out, "; last OK {}", timestamp(time)).unwrap();
+                    }
+                    if let Some(loss) = channel.udp_loss_percent {
+                        write!(out, "; loss {loss:.1}%").unwrap();
+                    }
+                    writeln!(out).unwrap();
                 }
-                let state = if channel.state == "PENDING" && channel.accepted_bytes > 0 {
-                    "RECEIVED"
-                } else {
-                    &channel.state
-                };
-                write!(out, " | {}: {}", channel.channel, short_state(state, color)).unwrap();
-                if channel.failures > 0 {
-                    write!(out, " ({} failed)", channel.failures).unwrap();
+                if let Some(deadline) = agent.next_result_at {
+                    let due = if deadline > now {
+                        format!("in {}", duration(deadline - now))
+                    } else {
+                        "due".to_owned()
+                    };
+                    writeln!(
+                        out,
+                        "  {} result: {due}{}",
+                        if agent.overall == "PENDING" {
+                            "First"
+                        } else {
+                            "Next"
+                        },
+                        if label == "STALE" {
+                            " (hub state is stale)"
+                        } else {
+                            ""
+                        }
+                    )
+                    .unwrap();
                 }
+            } else {
+                for channel in &agent.channels {
+                    if !channel.expected && channel.state != "UNENROLLED" {
+                        continue;
+                    }
+                    write!(
+                        out,
+                        " | {}: {}",
+                        channel.channel,
+                        channel_label(channel, color)
+                    )
+                    .unwrap();
+                }
+                writeln!(out).unwrap();
             }
             if agent.enrollment_failures > 0 {
-                write!(out, " | {}", paint("DNS enrollment failed", 31, color)).unwrap();
+                writeln!(out, "  {}", paint("DNS enrollment failed", 31, color)).unwrap();
             }
-            writeln!(out).unwrap();
         }
-        if self
+        if verbose {
+            for (source, observation) in &self.dns {
+                let value = |key: &str| {
+                    observation
+                        .split_whitespace()
+                        .find_map(|part| part.strip_prefix(key))
+                        .unwrap_or("?")
+                };
+                let ipv4 = value("ipv4_records=");
+                let ipv6 = value("ipv6_records=");
+                write!(out, "DNS {source}: A={ipv4}, AAAA={ipv6}").unwrap();
+                if value("ipv4_error=") == "true" {
+                    write!(out, "; {}", paint("A lookup failed", 31, color)).unwrap();
+                }
+                if value("ipv6_error=") == "true" {
+                    write!(out, "; {}", paint("AAAA lookup failed", 31, color)).unwrap();
+                }
+                writeln!(out).unwrap();
+            }
+        } else if self
             .dns
             .values()
             .any(|s| s.contains("ipv4_error=true") || s.contains("ipv6_error=true"))
         {
             writeln!(out, "{}", paint("DNS: lookup failed", 33, color)).unwrap();
         }
-        if self.queued_notifications > 0 {
+        if verbose || self.queued_notifications > 0 {
+            writeln!(out, "Notifications: {} pending", self.queued_notifications).unwrap();
+        }
+        if verbose && !self.observation_gaps.is_empty() {
             writeln!(
                 out,
-                "Notifications: {} pending",
-                paint(&self.queued_notifications.to_string(), 33, color)
+                "Hub downtime ({} recorded; no monitoring):",
+                self.observation_gaps.len()
             )
             .unwrap();
-        }
-        out
-    }
-    pub fn verbose_with_color(&self, now: u64, color: bool) -> String {
-        use crate::utils::paint;
-        use std::fmt::Write;
-        let mut out = String::new();
-        if self.last_observation == 0 {
-            writeln!(
-                out,
-                "{}",
-                paint(
-                    "Hub: no observations yet. Start the hub to begin monitoring.",
-                    33,
-                    color
+            for &(start, end) in &self.observation_gaps {
+                writeln!(
+                    out,
+                    "  {} to {} ({})",
+                    timestamp(start),
+                    timestamp(end),
+                    duration(end.saturating_sub(start))
                 )
-            )
-            .unwrap();
-        } else if self.last_observation > now {
-            writeln!(
-                out,
-                "{}",
-                paint(
-                    "Hub: observation timestamp is in the future; check the system clock.",
-                    33,
-                    color
-                )
-            )
-            .unwrap();
-        } else if now - self.last_observation > 10 {
-            writeln!(
-                out,
-                "{} (last observed {}). Data may be stale; check whether the hub is running.",
-                paint("Hub: no recent heartbeat", 33, color),
-                ago(self.last_observation, now)
-            )
-            .unwrap();
-        } else {
-            writeln!(
-                out,
-                "{} (observed {}).",
-                paint("Hub: recent heartbeat", 32, color),
-                ago(self.last_observation, now)
-            )
-            .unwrap();
-        }
-        if self.agents.is_empty() {
-            writeln!(out, "{}: no servers are being monitored.\nRun telegraff register NAME on the hub, copy NAME.toml to the agent, start the agent, and restart the hub to load the registration.", paint("No agents configured", 31, color)).unwrap();
-        } else {
-            writeln!(
-                out,
-                "Agents: {} (results from completed monitoring intervals)",
-                self.agents.len()
-            )
-            .unwrap();
-        }
-        for agent in &self.agents {
-            writeln!(
-                out,
-                "{}: {}",
-                agent.name,
-                colored_meaning(&agent.overall, color)
-            )
-            .unwrap();
-            if agent.enrollment_failures > 0 {
-                writeln!(out, "  Address-family enrollment failed for {} interval(s); check hub DNS and restart after correcting it.", agent.enrollment_failures).unwrap();
+                .unwrap();
             }
-            for channel in &agent.channels {
-                if !channel.expected && channel.state != "UNENROLLED" {
-                    continue;
-                }
-                let label = if channel.state == "PENDING" && channel.accepted_bytes > 0 {
-                    paint("data received; interval result pending", 33, color)
-                } else {
-                    colored_meaning(&channel.state, color)
-                };
-                write!(out, "  {}: {}", channel.channel, label).unwrap();
-                if channel.failures > 0 {
-                    write!(out, "; {} consecutive failed interval(s)", channel.failures).unwrap();
-                }
-                if let Some(time) = channel.last_success {
-                    write!(out, "; last success {}", ago(time, now)).unwrap();
-                }
-                writeln!(out).unwrap();
-            }
-        }
-        if self
-            .dns
-            .values()
-            .any(|s| s.contains("ipv4_error=true") || s.contains("ipv6_error=true"))
-        {
-            writeln!(
-                out,
-                "{}",
-                paint(
-                    "DNS warning: one or more lookups failed; see status --json for details.",
-                    33,
-                    color
-                )
-            )
-            .unwrap();
-        }
-        writeln!(
-            out,
-            "Notifications waiting to be sent: {}",
-            paint(
-                &self.queued_notifications.to_string(),
-                if self.queued_notifications == 0 {
-                    32
-                } else {
-                    33
-                },
-                color
-            )
-        )
-        .unwrap();
-        if let Some(&(start, end)) = self.observation_gaps.last() {
-            writeln!(out, "{}: last interruption lasted {}s (ended {}); {} recorded interruption(s). No observations were recorded during that time, so network health was unknown. This is a monitoring interruption, not proof of a network failure.", paint("Monitoring history", 33, color), end.saturating_sub(start), ago(end, now), self.observation_gaps.len()).unwrap();
-        }
-        writeln!(out, "Last observation: {}", self.last_observation).unwrap();
-        for (source, observation) in &self.dns {
-            writeln!(out, "DNS {source}: {observation}").unwrap();
-        }
-        for agent in &self.agents {
-            for channel in &agent.channels {
-                writeln!(out, "{} {}: expected={} state={} failures={} last_success={:?} cycle={:?} bytes={} udp_loss={:?}%", agent.name, channel.channel, channel.expected, channel.state, channel.failures, channel.last_success, channel.last_transfer_cycle, channel.accepted_bytes, channel.udp_loss_percent).unwrap();
-            }
-        }
-        for (start, end) in &self.observation_gaps {
-            writeln!(out, "Monitoring interruption: {start}..{end}").unwrap();
         }
         out
     }
 }
-fn short_state(state: &str, color: bool) -> String {
-    let (label, code) = match state {
-        "OK" => ("OK", 32),
-        "DEGRADED" | "MISSING" | "ALERT" | "FAILING" => ("FAIL", 31),
-        "PENDING" => ("WAIT", 33),
-        "UNENROLLED" => ("UNENROLLED", 33),
-        other => (other, 33),
+fn channel_label(channel: &ChannelStatus, color: bool) -> String {
+    let label = if channel.state == "PENDING" {
+        if channel.accepted_bytes > 0 {
+            "RECEIVED"
+        } else {
+            "NO DATA"
+        }
+    } else {
+        short_state(&channel.state)
     };
-    crate::utils::paint(label, code, color)
+    let count = if channel.failures > 0 {
+        format!(" ({} failed)", channel.failures)
+    } else {
+        String::new()
+    };
+    format!(
+        "{}{count}",
+        crate::utils::paint(label, state_color(&channel.state), color)
+    )
 }
-fn colored_meaning(state: &str, color: bool) -> String {
-    let code = match state {
+fn short_state(state: &str) -> &str {
+    match state {
+        "DEGRADED" | "MISSING" | "ALERT" | "FAILING" => "FAIL",
+        "PENDING" => "NO DATA",
+        "NOT_APPLICABLE" => "not monitored",
+        other => other,
+    }
+}
+fn state_color(state: &str) -> u8 {
+    match state {
         "OK" => 32,
         "DEGRADED" | "MISSING" | "ALERT" | "FAILING" => 31,
         _ => 33,
-    };
-    crate::utils::paint(meaning(state), code, color)
+    }
 }
 fn ago(time: u64, now: u64) -> String {
     if time > now {
-        return "in the future (check clock)".into();
-    }
-    let seconds = now - time;
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 3600 {
-        format!("{}m {}s ago", seconds / 60, seconds % 60)
+        "in the future (check clock)".into()
     } else {
-        format!("{}h {}m ago", seconds / 3600, seconds % 3600 / 60)
-    }
-}
-fn meaning(state: &str) -> &str {
-    match state {
-        "OK" => "working",
-        "DEGRADED" => "some channels are failing",
-        "MISSING" => "all expected channels have failed for at least three intervals",
-        "ALERT" => "failing; alert threshold reached",
-        "FAILING" => "failing; alert after three consecutive failed intervals",
-        "PENDING" => "waiting for the first completed monitoring interval",
-        "PAUSED" => "monitoring paused",
-        "UNENROLLED" => "unexpected address family; not enrolled for monitoring",
-        "NOT_APPLICABLE" => "not monitored",
-        _ => state,
-    }
-}
-#[cfg(test)]
-mod human_tests {
-    use super::*;
-    #[test]
-    fn empty_and_stale_status_does_not_claim_healthy_monitoring() {
-        let state = State {
-            observed_until: 100,
-            gaps: vec![(10, 94)],
-            ..State::default()
-        };
-        let text = Status::new(&state, &[]).verbose_with_color(200, false);
-        assert!(text.contains("no recent heartbeat"));
-        assert!(text.contains("No agents configured"));
-        assert!(text.contains("84s"));
-        assert!(text.contains("not proof of a network failure"));
-        assert!(!text.contains("dns_set="));
-        assert!(!text.contains('\x1b'));
-        let colored = Status::new(&state, &[]).verbose_with_color(200, true);
-        assert!(colored.contains("\x1b[31mNo agents configured\x1b[0m"));
-        assert!(colored.contains("\x1b[33mHub: no recent heartbeat\x1b[0m"));
-        let fresh = Status::new(&state, &[]).verbose_with_color(101, true);
-        assert!(fresh.contains("\x1b[32mHub: recent heartbeat\x1b[0m"));
+        format!("{} ago", crate::utils::duration(now - time))
     }
 }
 
 #[cfg(test)]
-mod compact_tests {
+mod tests {
     use super::*;
-    #[test]
-    fn compact_pending_and_failures_are_distinct_from_completed_success() {
-        let mut status = Status {
-            last_observation: 100,
-            queued_notifications: 0,
-            dns: BTreeMap::new(),
-            observation_gaps: vec![(1, 50)],
-            agents: vec![AgentStatus {
-                name: "test-node".into(),
-                overall: "PENDING".into(),
-                enrollment_failures: 0,
-                channels: vec![ChannelStatus {
-                    channel: "ipv4/tcp".into(),
-                    expected: true,
-                    state: "PENDING".into(),
-                    failures: 0,
-                    last_success: None,
-                    last_transfer_cycle: Some(90),
-                    accepted_bytes: 153600,
-                    udp_loss_percent: None,
-                }],
-            }],
+    use crate::application::{ChannelState, Transfer};
+    fn fixture() -> (State, Policy) {
+        let state = State {
+            observed_until: 200,
+            cycle_anchors: BTreeMap::from([("node".into(), 100)]),
+            dns: BTreeMap::from([("hub".into(), "ipv4_records=1 ipv6_records=0 ipv4_error=false ipv6_error=false dns_set=private-diagnostic-hash".into())]),
+            gaps: vec![(1, 167)],
+            transfers: vec![Transfer { agent:"node".into(), cycle:100, channel:Channel { family:Family::Ipv4, protocol:Protocol::Tcp }, transfer:0, bytes:153600, duration_ms:1, invalid:false, fingerprint:String::new() }],
+            ..State::default()
         };
-        let text = status.human(101);
+        let policy = Policy {
+            name: "node".into(),
+            activation: 0,
+            interval: 3600,
+            offset: 0,
+            grace: 3600,
+            paused: false,
+            families: vec![Family::Ipv4],
+            payload_bytes: 153600,
+            udp_threshold: 99,
+        };
+        (state, policy)
+    }
+    #[test]
+    fn initial_partial_delivery_has_a_reason_and_a_real_hub_deadline() {
+        let (state, policy) = fixture();
+        let status = Status::new(&state, &[policy]);
+        assert_eq!(status.agents[0].next_result_at, Some(3700));
+        let compact = status.human(200);
         assert_eq!(
-            text,
-            "Hub: ACTIVE (heartbeat 1s ago)\ntest-node: WAIT | ipv4/tcp: RECEIVED\n"
+            compact,
+            "Hub: ACTIVE (hub state updated 0s ago)\nnode: 1/2 channels received | ipv4/tcp: RECEIVED | ipv4/udp: NO DATA\n"
         );
-        assert!(!text.contains("Monitoring history"));
+        let verbose = status.verbose_with_color(200, false);
+        assert!(verbose.contains("interval 1h"));
+        assert!(verbose.contains("First result: in 58m 20s"));
+        assert!(verbose.contains("Hub downtime (1 recorded; no monitoring):"));
+        assert!(verbose.contains("1970-01-01 00:00 UTC to 1970-01-01 00:02 UTC (2m 46s)"));
+        assert!(verbose.contains("DNS hub: A=1, AAAA=0"));
+        for raw in [
+            "heartbeat",
+            "Some(",
+            "None",
+            "private-diagnostic-hash",
+            "expected=true",
+            "not proof",
+            "NOT_APPLICABLE",
+        ] {
+            assert!(
+                !verbose.contains(raw),
+                "Unexpected diagnostic representation: {raw}"
+            );
+        }
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["observation_gaps"][0][1], 167);
+        assert_eq!(json["agents"][0]["next_result_at"], 3700);
+        assert!(
+            json["dns"]["hub"]
+                .as_str()
+                .unwrap()
+                .contains("private-diagnostic-hash")
+        );
+    }
+    #[test]
+    fn received_data_does_not_claim_final_success_or_hide_failures() {
+        let (mut state, policy) = fixture();
+        let mut udp = state.transfers[0].clone();
+        udp.channel.protocol = Protocol::Udp;
+        state.transfers.push(udp);
+        let status = Status::new(&state, std::slice::from_ref(&policy));
+        assert!(status.human(200).contains("2/2 channels received"));
+        let colored = status.human_with_color(200, true);
+        assert!(colored.contains("\x1b[33mRECEIVED\x1b[0m"));
+        assert!(!colored.contains("\x1b[32mOK"));
+        state.channels.insert(
+            "node".into(),
+            BTreeMap::from([
+                (
+                    "ipv4/tcp".into(),
+                    ChannelState {
+                        last_success: Some(3700),
+                        last_finalized: Some(100),
+                        ..ChannelState::default()
+                    },
+                ),
+                (
+                    "ipv4/udp".into(),
+                    ChannelState {
+                        failures: 1,
+                        last_finalized: Some(100),
+                        ..ChannelState::default()
+                    },
+                ),
+            ]),
+        );
+        let status = Status::new(&state, &[policy]);
         assert!(
             status
-                .verbose_with_color(101, false)
-                .contains("Monitoring history")
+                .human_with_color(200, true)
+                .contains("\x1b[31mFAIL\x1b[0m")
         );
         assert!(
             status
-                .human_with_color(101, true)
-                .contains("\x1b[33mRECEIVED\x1b[0m")
-        );
-        status.agents[0].overall = "DEGRADED".into();
-        status.agents[0].channels[0].state = "FAILING".into();
-        status.agents[0].channels[0].failures = 1;
-        let text = status.human_with_color(101, true);
-        assert!(text.contains("\x1b[31mFAIL\x1b[0m"));
-        assert!(!text.contains("RECEIVED"));
-        assert!(status.human(120).contains("Hub: STALE"));
-        status.agents[0].overall = "OK".into();
-        status.agents[0].channels[0].state = "OK".into();
-        assert!(
-            status
-                .human_with_color(101, true)
+                .human_with_color(200, true)
                 .contains("\x1b[32mOK\x1b[0m")
         );
+        assert_eq!(status.agents[0].next_result_at, Some(7300));
+    }
+    #[test]
+    fn no_data_stale_paused_and_unenrolled_are_not_success() {
+        let (mut state, mut policy) = fixture();
+        state.transfers.clear();
+        assert!(
+            Status::new(&state, std::slice::from_ref(&policy))
+                .human(200)
+                .contains("0/2 channels received")
+        );
+        assert!(
+            Status::new(&state, std::slice::from_ref(&policy))
+                .human(220)
+                .contains("Hub: STALE")
+        );
+        policy.families.clear();
+        let status = Status::new(&state, std::slice::from_ref(&policy));
+        assert!(status.human(200).contains("awaiting enrollment"));
+        assert_eq!(status.agents[0].next_result_at, None);
+        policy.paused = true;
+        let status = Status::new(&state, &[policy]);
+        assert!(status.human(200).contains("PAUSED"));
+        assert_eq!(status.agents[0].next_result_at, None);
+    }
+    #[test]
+    fn legacy_schedules_do_not_use_continuous_anchors() {
+        let (state, mut policy) = fixture();
+        policy.grace = 600;
+        policy.activation = 500;
+        policy.offset = 200;
+        let status = Status::new(&state, &[policy]);
+        assert_eq!(status.agents[0].next_result_at, Some(4400));
     }
 }

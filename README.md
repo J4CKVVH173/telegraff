@@ -59,9 +59,10 @@ Remove an agent with `./telegraff unregister NAME`; revocation requires no resta
 ./telegraff config check          # validate config and TLS files
 ```
 
-`ACTIVE` means a recent hub heartbeat. Channel labels: `OK` passed, `WAIT` awaits an interval result,
-`RECEIVED` has data but no final result, `FAIL` failed. Green is success, yellow is pending, red is failure.
+`ACTIVE` means the hub recently updated its own state. During the first interval, agents show how many channels
+have received data: `RECEIVED` has data, `NO DATA` has none yet. `OK`/`FAIL` are completed interval results. Green is success, yellow is pending, red is failure.
 Colors are automatic in terminals; `NO_COLOR=1` disables them. JSON and redirected output have no colors.
+`-v` also shows time until the next interval result and dated hub downtime (UTC).
 `-v` / `--verbose` works with every command; JSON requires explicit `--json`, including in pipes.
 
 For an immediate agent check (stop the background agent first):

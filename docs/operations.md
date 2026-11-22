@@ -65,10 +65,12 @@ and preserves history and exported files. Explicit `[[agents]]` entries must be 
 Re-registering creates a new credential: replace the agent profile as well.
 
 Registered agents probe immediately, then repeat at their configured interval. The hub assigns cycles to persisted
-intervals; final results appear when an interval closes. `RECEIVED` is provisional. No receipt means delivery is
+intervals; final results appear when an interval closes. `RECEIVED` is provisional; the agent summary shows received/expected channel counts until the first result.
+`status -v` shows the interval length and next result time. No receipt means delivery is
 unconfirmed, even if the hub received some data. Three failed intervals trigger an alert; recovery is notified after
 a successful interval. Reminders default to six hours (`reminder_seconds = 0` disables them).
-Monitoring interruptions in `status -v` describe missing observations, not proof of network failure.
+Hub downtime in `status -v` uses UTC dates and human durations; it describes missing observations, not proof of network failure.
+Raw timestamps, DNS signatures and all channel fields remain in `status --json`.
 The hub cannot alert while stopped; monitor its process independently.
 
 ## Troubleshooting and updates

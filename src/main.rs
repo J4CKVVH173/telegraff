@@ -335,7 +335,11 @@ async fn execute(cli: Cli) -> Result<()> {
             telegraff::utils::message("Key created", 32);
         }
         Command::Status { config, json } => {
-            let Config::Hub(config) = load_config(&config)? else {
+            let loaded = Config::load(&config)?;
+            if cli.verbose && !json {
+                config_diagnostics(&config, &loaded, false)?;
+            }
+            let Config::Hub(config) = loaded else {
                 anyhow::bail!("Run status on the hub; use agent --once here")
             };
             let state = SqliteStore::read(&config.database)
@@ -378,68 +382,111 @@ async fn execute(cli: Cli) -> Result<()> {
 fn load_config(path: &std::path::Path) -> Result<Config> {
     let config = Config::load(path)?;
     if telegraff::utils::verbose() {
-        telegraff::utils::log(&format!("Configuration: {}", path.display()), 36);
-        match &config {
-            Config::Hub(hub) => {
-                telegraff::utils::log(
-                    &format!(
-                        "Hub: target={} public_port={:?} tcp={:?} udp={:?} database={} max_connections={} max_assemblies={} notifications={}",
-                        hub.target,
-                        hub.public_port,
-                        hub.tcp_listen,
-                        hub.udp_listen,
-                        hub.database.display(),
-                        hub.max_connections,
-                        hub.max_assemblies,
-                        hub.ntfy.is_some()
-                    ),
-                    36,
-                );
-                if let Some(tls) = &hub.tls {
-                    let (certificate, key) = tls.paths(&hub.target)?;
-                    telegraff::utils::log(
-                        &format!(
-                            "TLS: certificate={} key={}",
-                            certificate.display(),
-                            key.display()
-                        ),
-                        36,
-                    );
-                } else {
-                    telegraff::utils::log("Native TLS: disabled", 36);
-                }
-                for entry in &hub.agents {
-                    telegraff::utils::log(
-                        &format!(
-                            "Policy {}: interval={}s grace={}s offset={}s paused={} auto={} families={:?}",
-                            entry.name,
-                            entry.interval,
-                            entry.grace,
-                            entry.offset,
-                            entry.paused,
-                            entry.auto,
-                            entry.families
-                        ),
-                        36,
-                    );
-                }
-            }
-            Config::Agent(agent) => {
-                telegraff::utils::log(
-                    &format!(
-                        "Agent {}: hub={}:{} tls={:?} timeout={}s interval={}s udp_rate={} bytes/s",
-                        agent.agent.name,
-                        agent.hub,
-                        agent.port,
-                        agent.tls,
-                        agent.timeout_seconds,
-                        agent.agent.interval,
-                        agent.udp_bytes_per_second
-                    ),
-                    36,
-                );
-            }
-        }
+        config_diagnostics(path, &config, true)?;
     }
     Ok(config)
+}
+fn config_diagnostics(path: &std::path::Path, config: &Config, details: bool) -> Result<()> {
+    use telegraff::utils::{duration, log};
+    log(&format!("Configuration: {}", path.display()), 36);
+    match config {
+        Config::Hub(hub) => {
+            let tls = if hub.tls.is_some() {
+                "native TLS"
+            } else {
+                "plain TCP/HTTP"
+            };
+            let port = hub.public_port.unwrap_or(hub.tcp_listen[0].port());
+            log(
+                &format!(
+                    "Endpoint: {}:{port} ({tls}); database: {}",
+                    hub.target,
+                    hub.database.display()
+                ),
+                36,
+            );
+            let list = |addresses: &[std::net::SocketAddr]| {
+                addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            log(
+                &format!(
+                    "Listen: TCP {}; UDP {}",
+                    list(&hub.tcp_listen),
+                    list(&hub.udp_listen)
+                ),
+                36,
+            );
+            if details {
+                if let Some(tls) = &hub.tls {
+                    let (certificate, key) = tls.paths(&hub.target)?;
+                    log(
+                        &format!("TLS files: {}; {}", certificate.display(), key.display()),
+                        36,
+                    );
+                }
+                log(
+                    &format!(
+                        "Limits: {} connections, {} UDP assemblies; notifications: {}",
+                        hub.max_connections,
+                        hub.max_assemblies,
+                        if hub.ntfy.is_some() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ),
+                    36,
+                );
+                for entry in &hub.agents {
+                    let families = if entry.auto {
+                        "automatic".to_owned()
+                    } else {
+                        entry
+                            .families
+                            .iter()
+                            .map(|f| match f {
+                                telegraff::application::Family::Ipv4 => "IPv4",
+                                telegraff::application::Family::Ipv6 => "IPv6",
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    log(
+                        &format!(
+                            "Policy {}: every {}; window {}; families: {}{}",
+                            entry.name,
+                            duration(entry.interval),
+                            duration(entry.grace),
+                            families,
+                            if entry.paused { "; paused" } else { "" }
+                        ),
+                        36,
+                    );
+                }
+            }
+        }
+        Config::Agent(agent) => {
+            let tls = agent
+                .tls
+                .unwrap_or_else(|| agent.hub.parse::<std::net::IpAddr>().is_err());
+            log(
+                &format!(
+                    "Agent {}: {}:{} ({}); every {}; timeout {}; UDP {} bytes/s",
+                    agent.agent.name,
+                    agent.hub,
+                    agent.port,
+                    if tls { "HTTPS" } else { "plain TCP" },
+                    duration(agent.agent.interval),
+                    duration(agent.timeout_seconds),
+                    agent.udp_bytes_per_second
+                ),
+                36,
+            );
+        }
+    }
+    Ok(())
 }

@@ -244,7 +244,7 @@ fn status_uses_default_config_and_explains_empty_monitoring() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("Agents: 0"));
-    assert!(text.contains("Hub: WAIT"));
+    assert!(text.contains("Hub: NO UPDATES"));
     assert!(!text.contains("Last observation:"));
     assert!(!text.contains('\x1b'));
     for args in [["status", "--verbose"], ["-v", "status"], ["status", "-v"]] {
@@ -255,8 +255,8 @@ fn status_uses_default_config_and_explains_empty_monitoring() {
             .unwrap();
         assert!(verbose.status.success());
         let detail = String::from_utf8(verbose.stdout).unwrap();
-        assert!(detail.contains("Last observation: 0"));
-        assert!(detail.contains("Notifications waiting to be sent: 0"));
+        assert!(detail.contains("Hub: NO UPDATES"));
+        assert!(detail.contains("Notifications: 0 pending"));
         assert!(!detail.contains('\x1b'));
     }
     let json = Command::new(BIN)

@@ -21,6 +21,7 @@ sha2 = "0.10"
 socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "sync"] }
 toml = "0.9"
+time = "0.3"
 
 tempfile = "3"
 
