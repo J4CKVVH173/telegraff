@@ -209,3 +209,35 @@ fn daemon_lifecycle_and_exported_profile() {
     );
     assert!(stop.output().unwrap().status.success());
 }
+
+#[test]
+fn status_uses_default_config_and_explains_empty_monitoring() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.sqlite");
+    let mut store = SqliteStore::open(&database).unwrap();
+    store
+        .save(&telegraff::application::State::default())
+        .unwrap();
+    std::fs::write(dir.path().join("telegraff.toml"), format!("mode='hub'\ndatabase='{}'\ntarget='127.0.0.1'\ntcp_listen=['127.0.0.1:9477']\nudp_listen=['127.0.0.1:9477']\n", database.display())).unwrap();
+    let output = Command::new(BIN)
+        .current_dir(dir.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("No agents configured"));
+    assert!(text.contains("no observations yet"));
+    let json = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(value["agents"].as_array().unwrap().is_empty());
+}

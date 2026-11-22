@@ -53,7 +53,7 @@ enum Command {
         command: ConfigCommand,
     },
     Status {
-        #[arg(long)]
+        #[arg(long, default_value = "telegraff.toml")]
         config: PathBuf,
         #[arg(long)]
         json: bool,
@@ -140,8 +140,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 );
             }
             println!(
-                "Registered {name}. Copy {} to the agent as /etc/telegraff/agent.toml (mode 0600). Restart the hub to load this registration.",
-                path.display()
+                "Registered {name}. Copy the ready-to-copy configuration above to the agent (mode 0600). Restart the hub to load this registration."
             );
         }
         Command::Hub { config, daemon } => {
@@ -251,7 +250,8 @@ async fn execute(cli: Cli) -> Result<()> {
             let Config::Hub(config) = Config::load(&config)? else {
                 anyhow::bail!("Hub configuration required")
             };
-            let state = SqliteStore::read(&config.database)?;
+            let state = SqliteStore::read(&config.database)
+                .context("Cannot read hub state; start the hub first and check database access")?;
             let policies = config
                 .agents
                 .iter()
@@ -267,35 +267,7 @@ async fn execute(cli: Cli) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                println!(
-                    "Last observation: {} | queued notifications: {}",
-                    status.last_observation, status.queued_notifications
-                );
-                for agent in &status.agents {
-                    println!(
-                        "{} {} enrollment_failures={}",
-                        agent.name, agent.overall, agent.enrollment_failures
-                    );
-                    for c in &agent.channels {
-                        println!(
-                            "  {} {} failures={} last_success={:?} bytes={} udp_loss_pct={}",
-                            c.channel,
-                            c.state,
-                            c.failures,
-                            c.last_success,
-                            c.accepted_bytes,
-                            c.udp_loss_percent
-                                .map(|loss| format!("{loss:.2}"))
-                                .unwrap_or_else(|| "n/a".into())
-                        );
-                    }
-                }
-                for (role, summary) in &status.dns {
-                    println!("DNS {role}: {summary}");
-                }
-                for (start, end) in &status.observation_gaps {
-                    println!("Observation gap: {start}..{end}");
-                }
+                print!("{}", status.human(telegraff::utils::unix_time()));
             }
         }
     }

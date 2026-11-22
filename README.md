@@ -51,6 +51,8 @@ SQLite is bundled. HTTPS uses rustls and bundled public root certificates.
 
 Run `./telegraff` (or `./telegraff setup`) in a terminal for guided setup. Subsequent bare launches use `telegraff.toml` from the current directory. Hub setup asks for its public DNS name, local listener port, public port and database. It saves one configuration. Agent setup imports the private profile generated on the hub; it never asks you to retype the key, name or hub address.
 
+For agent setup, first copy `NAME.toml` exported by `register` from the hub to the agent. The wizard detects a single profile in the current directory; otherwise enter its filename or full path. Missing or invalid files can be corrected without restarting setup. An existing valid agent configuration is kept and its start command is shown. Nothing needs to be deleted; do not copy the hub configuration or create another key.
+
 ```sh
 ./telegraff hub --config hub.toml -d
 ./telegraff register node-01 --config hub.toml --output node-01.toml
@@ -110,7 +112,7 @@ UDP remains the existing encrypted datagram protocol: it is not HTTPS and has no
    sudo -u telegraff telegraff status --config /etc/telegraff/hub.toml --json
    ```
 
-   Cycle states finalize after the grace period. `FAILING` means one or two misses. `ALERT` means three or more. A working IPv4 channel does not clear IPv6 failures. No AAAA record is acceptable when IPv6 is not expected.
+   With the default `./telegraff.toml`, run `./telegraff status` without `--config`. The text summary explains recent/stale hub observations, empty registrations, pending checks, failed channels and notification backlog. A recent heartbeat is not proof that every probe passed. Historical monitoring interruptions mean the hub recorded no observations then; they do not prove a network failure. `--json` retains timestamps, DNS signatures and detailed fields for diagnostics. Results finalize after each monitoring interval. A working IPv4 channel does not clear IPv6 failures; a missing AAAA record is acceptable when IPv6 is not expected.
 
 3. To verify alert delivery, stop an agent service for three expected cycles. Expect one failure notification after the third deadline plus grace. Start the service again. Expect recovery after the next successful cycle finalizes. Reminders default to six hours; set `reminder_seconds = 0` to disable them.
 

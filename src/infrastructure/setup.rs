@@ -24,29 +24,64 @@ pub fn run() -> Result<()> {
     );
     let role = ask("Role (hub/agent)", "hub")?;
     let destination = PathBuf::from(ask("Configuration file", "telegraff.toml")?);
+    if role == "agent" && destination.exists() {
+        ensure!(
+            matches!(
+                super::config::Config::load(&destination)?,
+                super::config::Config::Agent(_)
+            ),
+            "Destination exists and is not an agent configuration; choose another file. Nothing was overwritten"
+        );
+        println!(
+            "Agent is already configured. Nothing needs to be deleted.\nStart: telegraff agent --config {} -d",
+            destination.display()
+        );
+        return Ok(());
+    }
     ensure!(
         !destination.exists(),
         "Destination already exists; refusing to overwrite"
     );
     if role == "agent" {
-        let source = PathBuf::from(ask(
-            "Profile file produced by telegraff register on the hub",
-            "agent.profile",
-        )?);
-        ensure!(
-            matches!(
-                super::config::Config::load(&source)?,
-                super::config::Config::Agent(_)
-            ),
-            "Agent profile required"
+        println!(
+            "On the hub, run: telegraff register NAME\nIt creates NAME.toml. Copy that file to this agent first.\nThe file already contains the hub address, name and key. Do not delete existing files or create a separate key."
         );
-        // Profiles contain their own key; legacy configs reference a separate file.
-        let contents = std::fs::read(&source)?;
-        let value: toml::Value = toml::from_str(std::str::from_utf8(&contents)?)?;
-        ensure!(
-            value.get("mode").and_then(|v| v.as_str()) == Some("profile"),
-            "Setup requires the self-contained profile from register"
-        );
+        let mut candidates = Vec::new();
+        for entry in std::fs::read_dir(".")? {
+            let path = entry?.path();
+            if path == destination
+                || !matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("toml" | "profile")
+                )
+            {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(&path)
+                && let Ok(value) = toml::from_str::<toml::Value>(&contents)
+                && value.get("mode").and_then(|v| v.as_str()) == Some("profile")
+            {
+                candidates.push(path);
+            }
+        }
+        let default = if candidates.len() == 1 {
+            candidates[0].display().to_string()
+        } else {
+            String::new()
+        };
+        let contents = loop {
+            let source = PathBuf::from(ask(
+                "File copied from hub (NAME.toml or its full path)",
+                &default,
+            )?);
+            match profile_contents(&source) {
+                Ok(contents) => break contents,
+                Err(error) => println!(
+                    "Cannot use {}: {error}.\nCopy the file from the hub, check its path, then try again. No files were changed.",
+                    source.display()
+                ),
+            }
+        };
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -117,4 +152,43 @@ pub fn run() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn profile_contents(path: &std::path::Path) -> Result<Vec<u8>> {
+    use anyhow::Context;
+    let contents = std::fs::read(path).context("file missing or unreadable")?;
+    let text = std::str::from_utf8(&contents).context("profile must be UTF-8 TOML")?;
+    let value: toml::Value =
+        toml::from_str(text).map_err(|_| anyhow::anyhow!("invalid profile TOML"))?;
+    ensure!(
+        value.get("mode").and_then(|v| v.as_str()) == Some("profile"),
+        "use the NAME.toml exported by register, not a hub or legacy configuration"
+    );
+    ensure!(
+        matches!(
+            super::config::Config::load(path)?,
+            super::config::Config::Agent(_)
+        ),
+        "agent profile required"
+    );
+    Ok(contents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn profile_errors_do_not_echo_secret_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "secret = 'DO_NOT_ECHO'\ninvalid syntax").unwrap();
+        let error = profile_contents(&path).unwrap_err().to_string();
+        assert!(!error.contains("DO_NOT_ECHO"));
+        assert!(
+            profile_contents(&dir.path().join("missing.toml"))
+                .unwrap_err()
+                .to_string()
+                .contains("missing or unreadable")
+        );
+    }
 }
