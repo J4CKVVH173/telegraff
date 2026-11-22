@@ -4,8 +4,7 @@ telegraff checks scheduled payload delivery from registered Linux servers to a h
 One Rust executable provides both roles. TCP, UDP, IPv4, and IPv6 have separate results.
 The hub sends an ntfy alert after three consecutive failed cycles for a channel.
 
-![graff](global/baner.png)
-
+![banner](global/banner.png)
 
 ## Requirements
 
