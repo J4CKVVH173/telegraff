@@ -27,7 +27,12 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
         .transpose()?;
     let registry = receiver::registry_with_limits(&config.agents, &config.ingress)?;
     let guard = super::ingress::Guard::new(config.ingress.clone(), config.max_assemblies);
-    let mut store = SqliteStore::open(&config.database)?;
+    let mut store = SqliteStore::open_bounded(
+        &config.database,
+        config.max_transfer_records,
+        config.database_max_mib,
+        config.retention_days,
+    )?;
     let mut state = store.load()?;
     let policies: Vec<Policy> = config
         .agents
@@ -74,6 +79,7 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
         monitor.forget(&name);
     }
     monitor.restart(unix_time());
+    monitor.state.bound_history(config.max_transfer_records);
     store.save(&monitor.state)?;
     let (tx, mut rx) = mpsc::channel::<Intake>(256);
     let permits = Arc::new(Semaphore::new(config.max_connections));
@@ -184,7 +190,10 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
                         (true,name)
                     }
                 };
-                if accepted { store.save(&monitor.state)?; }
+                if accepted {
+                    monitor.state.bound_history(config.max_transfer_records);
+                    store.save(&monitor.state)?;
+                }
                 let families = monitor.policies.iter().find(|p|p.name==name).map(|p|p.families.clone()).unwrap_or_default();
                 let _ = intake.accepted.send(receiver::IntakeReply {accepted,families});
             }
@@ -194,6 +203,8 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
                 for name in &removed { monitor.forget(name); }
                 config.agents.retain(|a| !removed.contains(&a.name));
                 monitor.tick(now);
+                if !has_notifier { monitor.state.outbox.clear(); }
+                monitor.state.bound_history(config.max_transfer_records);
                 store.save(&monitor.state)?;
                 if has_notifier && !in_flight && let Some(n) = monitor.state.notification_due(now) {
                         notify_tx.send((n.id,n.text.clone())).await?;
@@ -210,6 +221,7 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
                     // in flight. An already dispatched request cannot be recalled.
                     ensure!(!monitor.state.outbox.iter().any(|n| n.id == id), "Notification order mismatch");
                 }
+                monitor.state.bound_history(config.max_transfer_records);
                 store.save(&monitor.state)?;
             }
             _ = dns_tick.tick(), if !resolving => {
@@ -226,10 +238,12 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
                 let now = unix_time();
                 let automatic = config.agents.iter().filter(|a|a.auto).map(|a|a.name.clone()).collect::<Vec<_>>();
                 monitor.observe_dns(resolution.as_ref(),&automatic,now);
+                monitor.state.bound_history(config.max_transfer_records);
                 store.save(&monitor.state)?;
             }
         }
     }
+    monitor.state.bound_history(config.max_transfer_records);
     store.save(&monitor.state)?;
     tasks.abort_all();
     crate::utils::log("Hub: stopped", 33);

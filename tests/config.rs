@@ -12,6 +12,8 @@ fn config(key: std::path::PathBuf) -> Config {
         tcp_listen: vec!["127.0.0.1:9477".parse().unwrap()],
         udp_listen: vec!["127.0.0.1:9477".parse().unwrap()],
         retention_days: 30,
+        max_transfer_records: 100_000,
+        database_max_mib: 256,
         reminder_seconds: 21600,
         max_connections: 64,
         max_assemblies: 256,

@@ -167,3 +167,26 @@ fn forgetting_an_agent_cancels_its_alerts_and_preserves_history_and_other_agents
     assert_eq!(m.state.outbox[0].agent, "keeper");
     assert_eq!(m.state.transfers.len(), 1);
 }
+
+#[test]
+fn bounded_replay_tokens_reject_retired_messages_after_restart() {
+    use telegraff::application::ports::Repository;
+    use telegraff::infrastructure::store::SqliteStore;
+    let mut m = monitor();
+    m.policies[0].grace = 3600;
+    for token in 1..=1024 {
+        assert!(m.accept(transfer(token, Ipv4, Tcp, 153600), 100));
+    }
+    assert!(!m.accept(transfer(1025, Ipv4, Tcp, 153600), 100));
+    assert_eq!(m.state.cycle_tokens["node-01"].len(), 1024);
+    m.tick(7200);
+    assert!(m.state.cycle_tokens["node-01"].is_empty());
+    assert!(m.accept(transfer(1025, Ipv4, Tcp, 153600), 7200));
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SqliteStore::open(&dir.path().join("replay.sqlite")).unwrap();
+    store.save(&m.state).unwrap();
+    m.state = store.load().unwrap();
+    assert_eq!(m.state.retired_tokens["node-01"], 1024);
+    assert!(!m.accept(transfer(1, Ipv4, Tcp, 153600), 7300));
+    assert!(m.accept(transfer(1026, Ipv4, Tcp, 153600), 7300));
+}

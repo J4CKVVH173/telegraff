@@ -154,10 +154,60 @@ pub struct State {
     pub cycle_anchors: BTreeMap<String, u64>,
     #[serde(default)]
     pub cycle_tokens: BTreeMap<String, BTreeMap<u64, u64>>,
+    #[serde(default)]
+    pub retired_tokens: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub discarded_notifications: u64,
     pub observed_until: u64,
     pub gaps: Vec<(u64, u64)>,
 }
 impl State {
+    pub fn bound_history(&mut self, records: usize) {
+        let oversized = self
+            .cycle_tokens
+            .iter()
+            .filter(|(_, tokens)| tokens.len() > 1024)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in oversized {
+            self.retire_tokens(&name, 0);
+        }
+        if self.transfers.len() > records {
+            self.transfers.sort_by_key(|t| t.cycle);
+            self.transfers.drain(..self.transfers.len() - records);
+        }
+        if self.gaps.len() > 1024 {
+            self.gaps.drain(..self.gaps.len() - 1024);
+        }
+        if self.outbox.len() > 1024 {
+            let excess = self.outbox.len() - 1024;
+            self.outbox.drain(1..=excess);
+            self.discarded_notifications =
+                self.discarded_notifications.saturating_add(excess as u64);
+        }
+    }
+    pub fn retire_tokens(&mut self, agent: &str, oldest_cycle: u64) {
+        if let Some(tokens) = self.cycle_tokens.get_mut(agent) {
+            let mut retired = None::<u64>;
+            tokens.retain(|token, cycle| {
+                if *cycle < oldest_cycle {
+                    retired = Some(retired.unwrap_or(0).max(*token));
+                    false
+                } else {
+                    true
+                }
+            });
+            while tokens.len() > 1024 {
+                let (token, _) = tokens.pop_first().unwrap();
+                retired = Some(retired.unwrap_or(0).max(token));
+            }
+            if let Some(retired) = retired {
+                let floor = self.retired_tokens.entry(agent.to_owned()).or_default();
+                *floor = (*floor).max(retired);
+            }
+        }
+    }
+
     pub fn notification_due(&self, now: u64) -> Option<&Notification> {
         self.outbox.first().filter(|n| n.next_attempt <= now)
     }
@@ -175,7 +225,21 @@ impl State {
         true
     }
     pub fn enqueue(&mut self, agent: &str, now: u64, text: String) {
-        self.next_notification += 1;
+        if self.outbox.len() >= 1024 {
+            let excess = self.outbox.len() - 1023;
+            self.outbox.drain(1..=excess);
+            self.discarded_notifications =
+                self.discarded_notifications.saturating_add(excess as u64);
+        }
+        let mut text = text;
+        if text.len() > 4096 {
+            let mut end = 4096;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        self.next_notification = self.next_notification.saturating_add(1);
         self.outbox.push(Notification {
             id: self.next_notification,
             agent: agent.into(),

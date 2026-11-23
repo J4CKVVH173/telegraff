@@ -23,6 +23,8 @@ struct Cli {
 enum Command {
     /// Interactive first-time configuration.
     Setup,
+    #[command(hide = true)]
+    LogSink { path: PathBuf },
     /// Stop a background hub or agent using this configuration.
     Down {
         #[arg(long, default_value = "telegraff.toml")]
@@ -101,11 +103,17 @@ enum KeyCommand {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
     telegraff::utils::set_verbose(cli.verbose);
-    if let Err(e) = execute(cli).await {
+    let result = if let Some(Command::LogSink { path }) = &cli.command {
+        telegraff::infrastructure::logging::sink(path)
+    } else {
+        tokio::runtime::Runtime::new()
+            .map_err(anyhow::Error::from)
+            .and_then(|runtime| runtime.block_on(execute(cli)))
+    };
+    if let Err(e) = result {
         let error = if telegraff::utils::verbose() {
             format!("Error: {e:#}")
         } else {
@@ -154,6 +162,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 );
             }
         }
+        Command::LogSink { path } => telegraff::infrastructure::logging::sink(&path)?,
         Command::Setup => telegraff::infrastructure::setup::run()?,
         Command::Down { config } => telegraff::infrastructure::process::down(&config)?,
         Command::Register {
@@ -360,7 +369,7 @@ async fn execute(cli: Cli) -> Result<()> {
             let Config::Hub(config) = loaded else {
                 anyhow::bail!("Run status on the hub; use agent --once here")
             };
-            let state = SqliteStore::read(&config.database)
+            let state = SqliteStore::read_bounded(&config.database, config.max_transfer_records)
                 .context("Cannot read hub state; start the hub first and check database access")?;
             let policies = config
                 .agents
@@ -447,6 +456,13 @@ fn config_diagnostics(path: &std::path::Path, config: &Config, details: bool) ->
                 36,
             );
             if details {
+                log(
+                    &format!(
+                        "Storage: {} days; {} transfer records; {} MiB database cap",
+                        hub.retention_days, hub.max_transfer_records, hub.database_max_mib
+                    ),
+                    36,
+                );
                 if let Some(tls) = &hub.tls {
                     let (certificate, key) = tls.paths(&hub.target)?;
                     log(

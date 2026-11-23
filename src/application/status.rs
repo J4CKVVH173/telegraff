@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 pub struct Status {
     pub last_observation: u64,
     pub queued_notifications: usize,
+    pub discarded_notifications: u64,
     pub agents: Vec<AgentStatus>,
     pub dns: BTreeMap<String, String>,
     pub observation_gaps: Vec<(u64, u64)>,
@@ -154,6 +155,7 @@ impl Status {
         Self {
             last_observation: state.observed_until,
             queued_notifications: state.outbox.len(),
+            discarded_notifications: state.discarded_notifications,
             agents,
             dns: state.dns.clone(),
             observation_gaps: state.gaps.clone(),
@@ -194,6 +196,14 @@ impl Status {
             .unwrap();
         }
         writeln!(out).unwrap();
+        if self.discarded_notifications > 0 {
+            writeln!(
+                out,
+                "Notification backlog overflow: {} older pending messages discarded",
+                self.discarded_notifications
+            )
+            .unwrap();
+        }
         if self.agents.is_empty() {
             writeln!(
                 out,

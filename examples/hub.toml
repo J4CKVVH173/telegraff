@@ -8,6 +8,9 @@ target = "hub.example.net"
 tcp_listen = ["127.0.0.1:9477", "[::1]:9477"]
 udp_listen = ["127.0.0.1:9477", "[::1]:9477"]
 retention_days = 30
+# Both age and count apply: oldest history is removed first.
+max_transfer_records = 100000
+database_max_mib = 256
 reminder_seconds = 21600
 max_connections = 64
 max_assemblies = 256

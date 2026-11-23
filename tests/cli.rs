@@ -471,3 +471,32 @@ fn unregister_revokes_live_access_preserves_other_agents_and_rejects_old_key_aft
     );
     assert!(!exchange("removed", &old_key));
 }
+
+#[test]
+fn streaming_log_sink_rotates_actual_stdout_pipe_without_buffering_history() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("daemon.log");
+    let mut child = Command::new(BIN)
+        .arg("log-sink")
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for _ in 0..1280 {
+        input.write_all(&[b'x'; 8192]).unwrap();
+    }
+    input.write_all(b"latest-log-record").unwrap();
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(
+        std::fs::metadata(dir.path().join("daemon.log.1"))
+            .unwrap()
+            .len(),
+        10 * 1024 * 1024
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"latest-log-record");
+}

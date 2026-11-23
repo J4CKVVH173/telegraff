@@ -169,3 +169,63 @@ and timeouts. These are interval counts in the hub log, not persisted status sta
 This bounds application work and memory. It cannot prevent link saturation or guarantee availability under distributed
 traffic; network/provider filtering is still needed for volumetric attacks. Limits may cause failed monitoring cycles
 under load, which is preferable to reporting delivery that did not complete.
+
+## Bounded logs, history and memory
+
+Detached mode (`hub -d` / `agent -d`) automatically rotates its private runtime `.log` file at 10 MiB and keeps
+three archives (`.log.1` through `.log.3`), at most 40 MiB per configuration. Both stdout and stderr pass through
+a separate streaming sink with an 8 KiB buffer and a bounded OS pipe; a slow disk applies backpressure. Rotation
+runs on writes, including a single oversized write. Restart keeps the existing log/archives. On upgrade an oversized
+active log is reduced to its latest 10 MiB. Log rotation may split a line at a file boundary. Old runtime logs belonging
+to other configuration paths are not automatically removed.
+
+Hub history defaults (top-level TOML fields):
+
+```toml
+retention_days = 30
+max_transfer_records = 100000
+database_max_mib = 256
+```
+
+Age and record count both apply; the oldest history goes first. The same record cap applies to SQL history, hub RAM,
+the persistence cache and `status` reads. Configure at least 12 records per registered agent so an entire active cycle
+fits. SQLite's page cache targets 4 MiB and memory mapping is disabled. The record cap is configurable up to 1,000,000;
+RAM usage also depends on the number of configured agents and active connections, so this is not an absolute RSS cap.
+
+SQLite uses FULL synchronous commits, full auto-vacuum and a TRUNCATE rollback journal, which is emptied after each
+commit. This avoids a WAL accumulating behind long-lived readers; reads and writes can briefly block one another
+(up to the five-second busy timeout). A legacy WAL database is migrated on the next hub startup, with history pruning
+and one VACUUM to enable space reclamation. That first startup can take longer and needs temporary disk space.
+`status` remains read-only. Do not copy or delete live database journal files.
+
+`database_max_mib` limits the main database (16..16384 MiB), not the entire directory: a transaction's rollback journal
+can temporarily approach the database size, and migration/VACUUM needs additional temporary space. If the remaining
+active state cannot fit after cleanup, startup or persistence fails explicitly; it does not acknowledge unpersisted
+delivery or remove active incidents just to satisfy the cap. Metadata snapshots are limited to 8 MiB. Existing secrets,
+registration profiles and current monitoring counters are retained.
+
+In-memory metadata also has bounds: 1,024 notification messages (up to 4 KiB of text each), 1,024 observation gaps,
+and 1,024 replay tokens per agent across the current/previous hub interval. Without ntfy configured, pending notifications
+are cleared on the next tick. If notification delivery stays unavailable and the queue fills, the first/in-flight message
+and the newest waiting messages are kept. The persisted discard count is shown in text/JSON `status`.
+
+Old replay-token mappings are compacted into a persisted per-agent watermark. Previously retired tokens cannot count
+as new successes after a restart. New tokens below that watermark are rejected too: if an agent clock moves far backwards,
+restore its clock or re-register it with a new credential. A fixed difference between hub and agent clocks still works.
+
+For foreground redirection, the caller manages output-file rotation. Under systemd, journald manages the logs; detached
+mode's file sink is not used. For a separate bounded telegraff journal, install `packaging/journald@telegraff.conf` as
+`/etc/systemd/journald@telegraff.conf` and add a drop-in to the telegraff units:
+
+```ini
+[Service]
+LogNamespace=telegraff
+```
+
+Restart the telegraff journal namespace and services after installing the configuration. Read it with
+`journalctl --namespace=telegraff -u telegraff-hub` (or `telegraff-agent`). The namespace's limits apply only to its own
+journal; journald can exceed the target temporarily by active journal-file overhead. See
+[systemd journal namespaces and limits](https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html).
+For an absolute process-memory safety net, a service drop-in can set `MemoryHigh=192M` and `MemoryMax=256M`;
+size these for the agent count/history cap. The kernel may terminate the service at `MemoryMax`, and `Restart=on-failure`
+then restarts it. These optional service settings are not installed automatically.

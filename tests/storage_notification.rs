@@ -98,3 +98,80 @@ fn retention_removes_old_transfer_rows_without_rewriting_history() {
     store.save(&state).unwrap();
     assert!(store.load().unwrap().transfers.is_empty());
 }
+
+#[test]
+fn bounded_history_and_outbox_preserve_inflight_notification() {
+    let mut state = State::default();
+    for n in 0..1100 {
+        state.enqueue("node-01", n, "ж".repeat(3000));
+    }
+    assert_eq!(state.outbox.len(), 1024);
+    assert_eq!(state.outbox[0].id, 1);
+    assert_eq!(state.outbox.last().unwrap().id, 1100);
+    assert_eq!(state.discarded_notifications, 76);
+    assert!(state.outbox.iter().all(|n| n.text.len() <= 4096));
+    assert!(state.complete_notification(1, true, 1200));
+    assert_eq!(state.outbox[0].id, 78);
+    for n in 0..2000 {
+        state.gaps.push((n, n + 1));
+        state.transfers.push(common::transfer(
+            n,
+            telegraff::application::Family::Ipv4,
+            telegraff::application::Protocol::Tcp,
+            153600,
+        ));
+    }
+    state.bound_history(12);
+    assert_eq!(state.transfers.len(), 12);
+    assert_eq!(state.transfers[0].cycle, 1988);
+    assert_eq!(state.gaps.len(), 1024);
+    assert_eq!(state.gaps.last(), Some(&(1999, 2000)));
+}
+
+#[test]
+fn old_sqlite_history_is_capped_on_open_and_read_without_losing_incidents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.sqlite");
+    let mut state = State {
+        observed_until: 100,
+        ..State::default()
+    };
+    state.enqueue("node-01", 100, "pending alert".into());
+    for cycle in 1..=50 {
+        state.transfers.push(common::transfer(
+            cycle,
+            telegraff::application::Family::Ipv4,
+            telegraff::application::Protocol::Tcp,
+            153600,
+        ));
+    }
+    {
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.save(&state).unwrap();
+    }
+    // A read is bounded even before startup migration/cleanup runs.
+    let read = SqliteStore::read_bounded(&path, 5).unwrap();
+    assert_eq!(read.transfers.len(), 5);
+    assert_eq!(read.transfers[0].cycle, 46);
+    let mut store = SqliteStore::open_bounded(&path, 10, 16, 30).unwrap();
+    let mut state = store.load().unwrap();
+    assert_eq!(state.transfers.len(), 10);
+    assert_eq!(state.transfers[0].cycle, 41);
+    assert_eq!(state.outbox.len(), 1);
+    state.transfers.push(common::transfer(
+        51,
+        telegraff::application::Family::Ipv4,
+        telegraff::application::Protocol::Tcp,
+        153600,
+    ));
+    state.bound_history(10);
+    store.save(&state).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM transfers", [], |r| r
+            .get::<_, usize>(0))
+            .unwrap(),
+        10
+    );
+    assert_eq!(store.load().unwrap().transfers.last().unwrap().cycle, 51);
+}

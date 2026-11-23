@@ -63,11 +63,20 @@ pub fn start(role: &str, config: &Path) -> Result<()> {
     lock.try_lock()
         .context("Already running with this configuration")?;
     drop(lock);
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(sidecar(&config, "log")?)?;
+    let log_path = sidecar(&config, "log")?;
+    super::logging::prepare(&log_path)?;
+    let mut logger = Command::new("setsid")
+        .arg(std::env::current_exe()?)
+        .arg("log-sink")
+        .arg(&log_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Cannot start rotating log sink")?;
+    let log = logger.stdin.take().context("Log pipe unavailable")?;
+    use std::os::fd::AsFd;
+    let stderr = log.as_fd().try_clone_to_owned()?;
     let mut child = Command::new("setsid")
         .arg(std::env::current_exe()?)
         .arg(role)
@@ -79,15 +88,27 @@ pub fn start(role: &str, config: &Path) -> Result<()> {
         .arg("--config")
         .arg(&config)
         .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr))
         .spawn()
+        .inspect_err(|_| {
+            let _ = logger.kill();
+            let _ = logger.wait();
+        })
         .context("Cannot start background process (setsid required)")?;
     std::thread::sleep(Duration::from_millis(300));
     if let Some(status) = child.try_wait()? {
         anyhow::bail!(
             "{role} failed ({status}); log: {}",
             sidecar(&config, "log")?.display()
+        );
+    }
+    if logger.try_wait()?.is_some() {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!(
+            "Rotating log sink failed; check runtime log permissions and free space: {}",
+            log_path.display()
         );
     }
     crate::utils::message(&format!("Started {role}"), 32);

@@ -29,6 +29,12 @@ fn rate() -> u64 {
 fn retention() -> u64 {
     30
 }
+fn history_records() -> usize {
+    100_000
+}
+fn database_mib() -> u64 {
+    256
+}
 fn reminder() -> u64 {
     21600
 }
@@ -199,6 +205,10 @@ pub struct HubConfig {
     pub udp_listen: Vec<SocketAddr>,
     #[serde(default = "retention")]
     pub retention_days: u64,
+    #[serde(default = "history_records")]
+    pub max_transfer_records: usize,
+    #[serde(default = "database_mib")]
+    pub database_max_mib: u64,
     #[serde(default = "reminder")]
     pub reminder_seconds: u64,
     #[serde(default = "connections")]
@@ -292,6 +302,15 @@ impl Config {
                     "Public ports must be nonzero"
                 );
                 c.ingress.validate()?;
+                ensure!(
+                    (12..=1_000_000).contains(&c.max_transfer_records)
+                        && c.max_transfer_records >= c.agents.len().saturating_mul(12),
+                    "History record cap must fit at least one full cycle per agent (12 records)"
+                );
+                ensure!(
+                    (16..=16384).contains(&c.database_max_mib),
+                    "Database cap must be 16..16384 MiB"
+                );
                 if let Some(host) = &c.udp_target {
                     validate_host(host)?;
                 }

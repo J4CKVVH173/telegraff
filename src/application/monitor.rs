@@ -14,6 +14,7 @@ impl Monitor {
         self.state.enrollment_failures.remove(name);
         self.state.cycle_anchors.remove(name);
         self.state.cycle_tokens.remove(name);
+        self.state.retired_tokens.remove(name);
         for key in [
             name.to_owned(),
             format!("agent:{name}"),
@@ -32,11 +33,19 @@ impl Monitor {
             let Some(local_cycle) = policy.cycle_at(now) else {
                 return false;
             };
+            self.state
+                .retire_tokens(&result.agent, local_cycle.saturating_sub(policy.interval));
+            let retired = self.state.retired_tokens.get(&result.agent).copied();
             let tokens = self
                 .state
                 .cycle_tokens
                 .entry(result.agent.clone())
                 .or_default();
+            if !tokens.contains_key(&result.cycle)
+                && (tokens.len() >= 1024 || retired.is_some_and(|floor| result.cycle <= floor))
+            {
+                return false;
+            }
             let mapped = *tokens.entry(result.cycle).or_insert(local_cycle);
             // A token belongs to one hub interval forever. Old authenticated traffic
             // cannot count as a fresh successful cycle after a restart.
@@ -129,6 +138,13 @@ impl Monitor {
                 }
             }
         }
+        for p in &self.policies {
+            if let Some(cycle) = p.cycle_at(now) {
+                self.state
+                    .retire_tokens(&p.name, cycle.saturating_sub(p.interval));
+            }
+        }
+        self.state.bound_history(usize::MAX);
         self.state.observed_until = now;
     }
 
@@ -227,6 +243,13 @@ impl Monitor {
         self.state
             .gaps
             .retain(|(_, end)| now.saturating_sub(*end) <= self.retention);
+        for p in &self.policies {
+            if let Some(cycle) = p.cycle_at(now) {
+                self.state
+                    .retire_tokens(&p.name, cycle.saturating_sub(p.interval));
+            }
+        }
+        self.state.bound_history(usize::MAX);
         self.state.observed_until = now;
     }
 }
