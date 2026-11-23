@@ -103,12 +103,19 @@ pub fn run() -> Result<()> {
         ensure!(role == "hub", "Choose hub or agent");
         let host = ask("Public hub DNS name (without scheme)", "hub.example.net")?;
         let listen: u16 = ask("Local TCP/UDP listen port", "9477")?.parse()?;
-        let public: u16 = ask(
-            "Public TCP/UDP port (after forwarding)",
-            &listen.to_string(),
-        )?
-        .parse()?;
-        ensure!(listen > 0 && public > 0, "Ports must be nonzero");
+        let public: u16 =
+            ask("Public TCP port (after forwarding)", &listen.to_string())?.parse()?;
+        let udp_public: u16 =
+            ask("Public UDP port (direct or forwarded)", &public.to_string())?.parse()?;
+        let udp_host = ask(
+            "Public UDP host (same as TCP unless proxy has another address)",
+            &host,
+        )?;
+        super::config::validate_host(&udp_host)?;
+        ensure!(
+            listen > 0 && public > 0 && udp_public > 0,
+            "Ports must be nonzero"
+        );
         let database = ask("SQLite database path", "state.sqlite")?;
         let mut table = toml::Table::new();
         for (k, v) in [
@@ -119,12 +126,32 @@ pub fn run() -> Result<()> {
             table.insert(k.into(), toml::Value::String(v.into()));
         }
         table.insert("public_port".into(), toml::Value::Integer(public.into()));
+        if udp_public != public {
+            table.insert(
+                "public_udp_port".into(),
+                toml::Value::Integer(udp_public.into()),
+            );
+        }
+        if udp_host != host {
+            table.insert("udp_target".into(), toml::Value::String(udp_host));
+        }
+        let udp_bind = ask(
+            "UDP listener access (loopback/public; public for direct UDP)",
+            "loopback",
+        )?;
+        ensure!(
+            matches!(udp_bind.as_str(), "loopback" | "public"),
+            "Choose loopback or public for UDP"
+        );
         for k in ["tcp_listen", "udp_listen"] {
+            let public_udp = k == "udp_listen" && udp_bind == "public";
+            let ipv4 = if public_udp { "0.0.0.0" } else { "127.0.0.1" };
+            let ipv6 = if public_udp { "::" } else { "::1" };
             table.insert(
                 k.into(),
                 toml::Value::Array(vec![
-                    toml::Value::String(format!("127.0.0.1:{listen}")),
-                    toml::Value::String(format!("[::1]:{listen}")),
+                    toml::Value::String(format!("{ipv4}:{listen}")),
+                    toml::Value::String(format!("[{ipv6}]:{listen}")),
                 ]),
             );
         }

@@ -191,6 +191,10 @@ pub struct HubConfig {
     pub target: String,
     #[serde(default)]
     pub public_port: Option<u16>,
+    pub public_udp_port: Option<u16>,
+    pub udp_target: Option<String>,
+    #[serde(default)]
+    pub ingress: super::ingress::Limits,
     pub tcp_listen: Vec<SocketAddr>,
     pub udp_listen: Vec<SocketAddr>,
     #[serde(default = "retention")]
@@ -213,6 +217,8 @@ pub struct AgentConfig {
     pub ca_file: Option<PathBuf>,
     pub hub: String,
     pub port: u16,
+    pub udp_port: Option<u16>,
+    pub udp_hub: Option<String>,
     #[serde(default = "cycle_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "rate")]
@@ -230,6 +236,8 @@ impl AgentConfig {
         Self {
             hub,
             port,
+            udp_port: None,
+            udp_hub: None,
             tls: None,
             ca_file: None,
             timeout_seconds: cycle_timeout(),
@@ -279,7 +287,14 @@ impl Config {
         match self {
             Self::Hub(c) => {
                 ensure!(!c.target.is_empty(), "Hub target is required");
-                ensure!(c.public_port != Some(0), "Public port must be nonzero");
+                ensure!(
+                    c.public_port != Some(0) && c.public_udp_port != Some(0),
+                    "Public ports must be nonzero"
+                );
+                c.ingress.validate()?;
+                if let Some(host) = &c.udp_target {
+                    validate_host(host)?;
+                }
                 ensure!(
                     !c.tcp_listen.is_empty() && !c.udp_listen.is_empty(),
                     "TCP and UDP listeners are required"
@@ -314,6 +329,10 @@ impl Config {
             }
             Self::Agent(c) => {
                 c.agent.validate()?;
+                ensure!(c.udp_port != Some(0), "UDP port must be nonzero");
+                if let Some(host) = &c.udp_hub {
+                    validate_host(host)?;
+                }
                 super::agent::SocketTransport::for_hub(
                     vec![0; 32],
                     c.udp_bytes_per_second,
@@ -371,5 +390,24 @@ pub(super) fn check_permissions(path: &Path) -> Result<()> {
         metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
         "Secret file must be a regular file with mode 0600 or stricter"
     );
+    Ok(())
+}
+
+pub(super) fn validate_host(host: &str) -> Result<()> {
+    ensure!(
+        !host.trim().is_empty() && host == host.trim() && !host.contains(['/', '@', '?', '#']),
+        "UDP host must be a DNS name or IP literal"
+    );
+    if host.parse::<std::net::IpAddr>().is_err() {
+        ensure!(
+            host.len() <= 253
+                && host.trim_end_matches('.').split('.').all(|s| !s.is_empty()
+                    && s.len() <= 63
+                    && !s.starts_with('-')
+                    && !s.ends_with('-')
+                    && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')),
+            "Invalid UDP hostname"
+        );
+    }
     Ok(())
 }

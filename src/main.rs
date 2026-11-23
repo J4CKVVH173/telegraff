@@ -35,6 +35,12 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         port: Option<u16>,
+        /// UDP port (defaults to the TCP port).
+        #[arg(long)]
+        udp_port: Option<u16>,
+        /// Direct UDP destination when HTTPS uses a different host.
+        #[arg(long)]
+        udp_hub: Option<String>,
         #[arg(long, default_value_t = 0)]
         offset: u64,
         /// Write a ready-to-copy private agent configuration.
@@ -154,6 +160,8 @@ async fn execute(cli: Cli) -> Result<()> {
             name,
             config,
             port,
+            udp_port,
+            udp_hub,
             offset,
             output,
         } => {
@@ -167,8 +175,14 @@ async fn execute(cli: Cli) -> Result<()> {
                     "Output already exists; refusing to overwrite"
                 );
             }
-            let path =
-                telegraff::infrastructure::registration::register(&hub, &name, port, offset)?;
+            let path = telegraff::infrastructure::registration::register_with_udp(
+                &hub,
+                &name,
+                port,
+                udp_port,
+                udp_hub.as_deref(),
+                offset,
+            )?;
             if let Some(output) = output {
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -216,6 +230,8 @@ async fn execute(cli: Cli) -> Result<()> {
                 policy: config.agent.policy(),
                 hub: config.hub.clone(),
                 port: config.port,
+                udp_port: config.udp_port,
+                udp_hub: config.udp_hub.clone(),
                 timeout_seconds: config.timeout_seconds,
                 auto: config.agent.auto,
             };
@@ -407,6 +423,14 @@ fn config_diagnostics(path: &std::path::Path, config: &Config, details: bool) ->
                 ),
                 36,
             );
+            log(
+                &format!(
+                    "UDP endpoint: {}:{}",
+                    hub.udp_target.as_deref().unwrap_or(&hub.target),
+                    hub.public_udp_port.unwrap_or(port)
+                ),
+                36,
+            );
             let list = |addresses: &[std::net::SocketAddr]| {
                 addresses
                     .iter()
@@ -477,14 +501,16 @@ fn config_diagnostics(path: &std::path::Path, config: &Config, details: bool) ->
                 .unwrap_or_else(|| agent.hub.parse::<std::net::IpAddr>().is_err());
             log(
                 &format!(
-                    "Agent {}: {}:{} ({}); every {}; timeout {}; UDP {} bytes/s",
+                    "Agent {}: {}:{} ({}); every {}; timeout {}; UDP {} bytes/s to {}:{}",
                     agent.agent.name,
                     agent.hub,
                     agent.port,
                     if tls { "HTTPS" } else { "plain TCP" },
                     duration(agent.agent.interval),
                     duration(agent.timeout_seconds),
-                    agent.udp_bytes_per_second
+                    agent.udp_bytes_per_second,
+                    agent.udp_hub.as_deref().unwrap_or(&agent.hub),
+                    agent.udp_port.unwrap_or(agent.port)
                 ),
                 36,
             );

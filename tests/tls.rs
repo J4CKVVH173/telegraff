@@ -485,3 +485,83 @@ fn native_tls_automatic_certbot_paths_and_overrides() {
         PathBuf::from("/etc/letsencrypt/live/hub.example.net/privkey.pem")
     );
 }
+
+#[tokio::test]
+async fn full_agent_cycle_uses_https_proxy_and_direct_udp_on_another_port() {
+    use async_trait::async_trait;
+    use telegraff::application::{
+        agent::{self, AgentSettings},
+        ports::Resolver,
+    };
+    struct Endpoints(IpAddr);
+    #[async_trait]
+    impl Resolver for Endpoints {
+        async fn resolve(&self, host: &str) -> anyhow::Result<Resolution> {
+            assert!(matches!(host, "hub.test" | "origin.test"));
+            Ok(Resolution {
+                addresses: vec![self.0],
+                ipv4_error: false,
+                ipv6_error: false,
+            })
+        }
+    }
+    for ip in [
+        "127.0.0.1".parse::<IpAddr>().unwrap(),
+        "::1".parse().unwrap(),
+    ] {
+        let mut fixture = Fixture::new(ip).await;
+        let mut entry = common::entry(common::key_file(fixture._dir.path()));
+        entry.grace = entry.interval;
+        let family = receiver::family(ip);
+        entry.families = vec![family];
+        let udp = receiver::bind_udp((ip, 0).into()).unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        assert_ne!(udp_port, fixture.address.port());
+        let (tx, mut rx) = mpsc::channel::<Intake>(32);
+        let registry = receiver::registry(&[entry.clone()]).unwrap();
+        fixture.tasks.push(tokio::spawn(async move {
+            receiver::udp_loop(udp, registry, tx, 8).await.unwrap();
+        }));
+        let config = AgentSettings {
+            policy: entry.policy(),
+            hub: "hub.test".into(),
+            port: fixture.address.port(),
+            udp_port: Some(udp_port),
+            udp_hub: Some("origin.test".into()),
+            timeout_seconds: 30,
+            auto: true,
+        };
+        let mut transport = fixture.transport("hub.test", true);
+        let endpoints = Endpoints(ip);
+        let run = agent::run(
+            &config,
+            &endpoints,
+            &mut transport,
+            &telegraff::infrastructure::SystemClock,
+        );
+        let respond = async {
+            loop {
+                let event = tokio::select! { event=fixture.intake.recv()=>event.unwrap(), event=rx.recv()=>event.unwrap() };
+                event
+                    .accepted
+                    .send(receiver::IntakeReply {
+                        accepted: true,
+                        families: vec![family],
+                    })
+                    .unwrap();
+            }
+        };
+        let report = tokio::select! { result=run=>result.unwrap(), ()=respond=>unreachable!() };
+        assert!(report.successful(), "{report:?}");
+        assert_eq!(report.channels.len(), 2);
+        assert!(
+            report
+                .channels
+                .iter()
+                .all(|c| c.accepted_bytes == 153600 && c.transfers.len() == 3)
+        );
+        for _ in 0..4 {
+            assert_eq!(fixture.sni.recv().await.unwrap(), "hub.test");
+        }
+    }
+}

@@ -53,6 +53,8 @@ fn settings() -> AgentSettings {
         policy: common::policy(),
         hub: "hub.example.net".into(),
         port: 9477,
+        udp_port: None,
+        udp_hub: None,
         timeout_seconds: 120,
         auto: false,
     }
@@ -207,4 +209,58 @@ fn dns_view_difference_is_detected_even_with_equal_record_counts() {
     assert!(m.state.dns.contains_key("view:node-01"));
     m.observe_agent_dns("node-01", answers(&["127.0.0.1"]).0.observation());
     assert!(!m.state.dns.contains_key("view:node-01"));
+}
+
+struct SplitAnswers {
+    udp_fails: bool,
+}
+#[async_trait]
+impl Resolver for SplitAnswers {
+    async fn resolve(&self, host: &str) -> Result<Resolution> {
+        if host == "udp.example.net" {
+            if self.udp_fails {
+                anyhow::bail!("UDP DNS unavailable");
+            }
+            Ok(answers(&["192.0.2.2"]).0)
+        } else {
+            Ok(answers(&["192.0.2.1"]).0)
+        }
+    }
+}
+#[tokio::test]
+async fn independent_udp_host_port_and_dns_failure() {
+    let mut config = settings();
+    config.policy.families = vec![Family::Ipv4];
+    config.port = 443;
+    config.udp_port = Some(9477);
+    config.udp_hub = Some("udp.example.net".into());
+    for udp_fails in [false, true] {
+        let mut sender = Sender::default();
+        let report = agent::run(
+            &config,
+            &SplitAnswers { udp_fails },
+            &mut sender,
+            &FixedClock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.successful(), !udp_fails);
+        assert!(
+            sender
+                .calls
+                .iter()
+                .filter(|(_, p)| *p == Protocol::Tcp)
+                .all(|(a, _)| *a == "192.0.2.1:443".parse().unwrap())
+        );
+        let udp: Vec<_> = sender
+            .calls
+            .iter()
+            .filter(|(_, p)| *p == Protocol::Udp)
+            .collect();
+        assert_eq!(udp.len(), if udp_fails { 0 } else { 3 });
+        assert!(
+            udp.iter()
+                .all(|(a, _)| *a == "192.0.2.2:9477".parse().unwrap())
+        );
+    }
 }

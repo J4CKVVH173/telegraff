@@ -21,6 +21,9 @@ fn example_configuration_runs_a_hub_and_agent() {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     drop(socket);
+    let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_port = udp_socket.local_addr().unwrap().port();
+    drop(udp_socket);
     let offset = telegraff::utils::unix_time() % 3600;
     let source = include_str!("../examples/hub.toml");
     let ntfy_start = source.find("[ntfy]").unwrap();
@@ -34,13 +37,24 @@ fn example_configuration_runs_a_hub_and_agent() {
             "[\"127.0.0.1:9477\", \"[::1]:9477\"]",
             &format!("[\"127.0.0.1:{port}\"]"),
         );
+    let hub = hub.replace(
+        &format!("udp_listen = [\"127.0.0.1:{port}\"]"),
+        &format!("udp_listen = [\"127.0.0.1:{udp_port}\"]"),
+    );
     std::fs::write(&hub_file, hub).unwrap();
     let register = || {
         Command::new(BIN)
             .current_dir(dir.path())
             .args(["register", "node-01", "--config"])
             .arg(&hub_file)
-            .args(["--offset", &offset.to_string()])
+            .args([
+                "--offset",
+                &offset.to_string(),
+                "--udp-port",
+                &udp_port.to_string(),
+                "--udp-hub",
+                "127.0.0.1",
+            ])
             .output()
             .unwrap()
     };

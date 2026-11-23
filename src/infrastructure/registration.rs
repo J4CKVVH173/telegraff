@@ -25,6 +25,10 @@ pub(super) struct Profile {
     name: String,
     hub: String,
     port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    udp_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    udp_hub: Option<String>,
     offset: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls: Option<bool>,
@@ -44,6 +48,8 @@ impl Profile {
             self.port,
             self.offset,
         );
+        config.udp_port = self.udp_port;
+        config.udp_hub = self.udp_hub.clone();
         config.tls = self.tls;
         config.ca_file = self.ca_file.clone();
         if self.continuous {
@@ -108,7 +114,26 @@ pub(super) fn load_registry(hub: &mut HubConfig) -> Result<()> {
 }
 
 pub fn register(hub: &HubConfig, name: &str, port: Option<u16>, offset: u64) -> Result<PathBuf> {
+    register_with_udp(hub, name, port, None, None, offset)
+}
+
+pub fn register_with_udp(
+    hub: &HubConfig,
+    name: &str,
+    port: Option<u16>,
+    udp_port: Option<u16>,
+    udp_hub: Option<&str>,
+    offset: u64,
+) -> Result<PathBuf> {
     validate_name(name)?;
+    let udp_port = udp_port.or(hub.public_udp_port);
+    let udp_hub = udp_hub
+        .map(str::to_owned)
+        .or_else(|| hub.udp_target.clone());
+    ensure!(udp_port != Some(0), "UDP port must be nonzero");
+    if let Some(host) = &udp_hub {
+        super::config::validate_host(host)?;
+    }
     ensure!(
         !hub.agents.iter().any(|a| a.name == name),
         "Agent already registered"
@@ -126,6 +151,8 @@ pub fn register(hub: &HubConfig, name: &str, port: Option<u16>, offset: u64) -> 
         name: name.to_owned(),
         hub: hub.target.clone(),
         port,
+        udp_port,
+        udp_hub,
         offset,
         continuous: true,
         tls: hub.tls.as_ref().map(|_| true),

@@ -25,7 +25,8 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
         .as_ref()
         .map(|tls| tls.acceptor(&config.target))
         .transpose()?;
-    let registry = receiver::registry(&config.agents)?;
+    let registry = receiver::registry_with_limits(&config.agents, &config.ingress)?;
+    let guard = super::ingress::Guard::new(config.ingress.clone(), config.max_assemblies);
     let mut store = SqliteStore::open(&config.database)?;
     let mut state = store.load()?;
     let policies: Vec<Policy> = config
@@ -77,21 +78,41 @@ pub async fn run(mut config: HubConfig, resolver: &impl Resolver) -> Result<()> 
     let (tx, mut rx) = mpsc::channel::<Intake>(256);
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
+    let reporting = guard.clone();
+    tasks.spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let counts = reporting.take_rejections();
+            if !counts.is_empty() {
+                let summary = counts
+                    .iter()
+                    .map(|(reason, n)| format!("{reason}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::utils::log(&format!("Ingress rejected (interval): {summary}"), 33);
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    });
     for addr in &config.tcp_listen {
-        tasks.spawn(receiver::tcp_loop_with_tls(
+        tasks.spawn(receiver::tcp_loop_guarded(
             receiver::bind_tcp(*addr)?,
             registry.clone(),
             tx.clone(),
             permits.clone(),
             tls.clone(),
+            guard.clone(),
         ));
     }
     for addr in &config.udp_listen {
-        tasks.spawn(receiver::udp_loop(
+        tasks.spawn(receiver::udp_loop_guarded(
             receiver::bind_udp(*addr)?,
             registry.clone(),
             tx.clone(),
             config.max_assemblies,
+            guard.clone(),
         ));
     }
     let (notify_tx, mut notify_rx) = mpsc::channel::<(u64, String)>(1);

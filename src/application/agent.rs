@@ -13,6 +13,8 @@ pub struct AgentSettings {
     pub policy: Policy,
     pub hub: String,
     pub port: u16,
+    pub udp_port: Option<u16>,
+    pub udp_hub: Option<String>,
     pub timeout_seconds: u64,
     pub auto: bool,
 }
@@ -22,6 +24,8 @@ pub struct AgentReport {
     pub agent: String,
     pub cycle: u64,
     pub dns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udp_dns: Option<String>,
     pub channels: Vec<ChannelReport>,
 }
 #[derive(Debug, Serialize)]
@@ -78,6 +82,16 @@ pub async fn run(
         ipv4_error: true,
         ipv6_error: true,
     });
+    let udp_resolution = if let Some(host) = config.udp_hub.as_deref().filter(|h| *h != config.hub)
+    {
+        resolver.resolve(host).await.unwrap_or(Resolution {
+            addresses: Vec::new(),
+            ipv4_error: true,
+            ipv6_error: true,
+        })
+    } else {
+        resolution.clone()
+    };
     let enrolled = transport
         .identify(IdentityRequest {
             addresses: resolution
@@ -99,7 +113,11 @@ pub async fn run(
         policy.families.clone()
     };
     let mut families = expected.clone();
-    for f in resolution.families() {
+    for f in resolution
+        .families()
+        .into_iter()
+        .chain(udp_resolution.families())
+    {
         if !families.contains(&f) {
             families.push(f);
         }
@@ -120,6 +138,7 @@ pub async fn run(
         agent: policy.name.clone(),
         cycle,
         dns: resolution.summary(),
+        udp_dns: config.udp_hub.as_ref().map(|_| udp_resolution.summary()),
         channels: Vec::new(),
     };
     let channels: Vec<_> = families
@@ -143,7 +162,17 @@ pub async fn run(
         let channel_deadline = Instant::now()
             + deadline.saturating_duration_since(Instant::now())
                 / ((channels.len() - channel_index) as u32);
-        let addresses: Vec<_> = resolution
+        let destination = if protocol == Protocol::Udp {
+            &udp_resolution
+        } else {
+            &resolution
+        };
+        let port = if protocol == Protocol::Udp {
+            config.udp_port.unwrap_or(config.port)
+        } else {
+            config.port
+        };
+        let addresses: Vec<_> = destination
             .addresses
             .iter()
             .filter(|ip| {
@@ -153,7 +182,7 @@ pub async fn run(
                     Family::Ipv6 == f
                 }
             })
-            .map(|ip| SocketAddr::new(*ip, config.port))
+            .map(|ip| SocketAddr::new(*ip, port))
             .collect();
         let mut result = ChannelReport {
             channel: channel.label(),
@@ -166,7 +195,9 @@ pub async fn run(
         for transfer in 0..3 {
             let mut accepted_bytes = 0;
             let mut received = false;
-            let mut last_error = None;
+            let mut last_error = addresses.is_empty().then(|| {
+                "No destination address for this channel; check DNS and address families".to_owned()
+            });
             let transfer_deadline = Instant::now()
                 + channel_deadline.saturating_duration_since(Instant::now())
                     / u32::from(3 - transfer);
@@ -330,6 +361,9 @@ impl AgentReport {
             .unwrap();
         }
         writeln!(out, "Cycle: {}\nDNS: {}", self.cycle, self.dns).unwrap();
+        if let Some(dns) = &self.udp_dns {
+            writeln!(out, "UDP DNS: {dns}").unwrap();
+        }
         for channel in &self.channels {
             for attempt in &channel.transfers {
                 writeln!(
@@ -361,6 +395,7 @@ mod human_tests {
             agent: "node-test".into(),
             cycle: 1,
             dns: String::new(),
+            udp_dns: None,
             channels: vec![
                 ChannelReport {
                     channel: "ipv4/tcp".into(),
@@ -400,6 +435,7 @@ mod compact_tests {
             agent: "test-node".into(),
             cycle: 123,
             dns: "dns-diagnostic".into(),
+            udp_dns: None,
             channels: vec![ChannelReport {
                 channel: "ipv4/udp".into(),
                 expected: true,

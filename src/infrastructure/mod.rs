@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod dns;
 pub mod hub;
+pub mod ingress;
 pub mod notification;
 pub mod receiver;
 pub mod registration;

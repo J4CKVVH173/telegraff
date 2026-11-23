@@ -31,9 +31,32 @@ certbot deploy hook. Keep private key permissions restricted. A missing file or 
 run `./telegraff config check -v` to see the underlying error.
 
 With native TLS, nginx `stream` passes the hub domain's TLS connection to `tcp_listen` without decrypting it.
-Keep listeners on `127.0.0.1` / `::1` when the proxy runs on the same host. Public TCP and UDP must both be forwarded;
-`public_port` advertises the external port, independently of local listener ports. UDP has no SNI and needs its own route.
+Keep TCP listeners on `127.0.0.1` / `::1` when the proxy runs on the same host. UDP needs its own route; it has no SNI.
+`public_port` advertises the external TCP port, independently of local listener ports. UDP uses the same public port
+unless `public_udp_port` is set. `udp_target` optionally advertises a different host for direct UDP.
 The hub's startup TCP check proves reachability only; an agent cycle checks receipts and authentication.
+
+For HTTPS on TCP 443 through a proxy and direct UDP 9477, set these top-level hub fields:
+
+```toml
+public_port = 443
+public_udp_port = 9477
+tcp_listen = ["127.0.0.1:9477", "[::1]:9477"]
+udp_listen = ["0.0.0.0:9477", "[::]:9477"]
+# udp_target = "origin.example.net" # if the proxy and origin use different addresses
+```
+
+Allow inbound UDP 9477 in the host/provider firewall; forward it separately if the hub is behind NAT.
+Guided setup asks for the public TCP/UDP ports and UDP host. Choose `public` for UDP listener access when agents
+connect directly; `loopback` is for a local UDP forwarder.
+
+The exported agent profile contains `port = 443` and `udp_port = 9477`, plus `udp_hub` when `udp_target` is set.
+`register NAME --udp-port 9477 --udp-hub origin.example.net` overrides those UDP defaults for a new profile.
+Existing exported profiles keep their settings; edit them to add `udp_port` / `udp_hub`, or copy the updated profile
+securely to the agent. Keep its secret unchanged. Upgrade the hub and agents before using the new fields. Omitted UDP fields preserve the old shared endpoint behavior.
+Both names should provide the address families monitored by the policy; TCP and UDP failures remain independent.
+UDP DNS failures do not fall back to the proxy's address. Separate UDP DNS details appear in verbose/JSON reports.
+
 
 Alternatively, nginx can terminate TLS. Omit `[tls]` from the hub and add this to nginx's HTTPS server for the domain
 (replace 9477 with the hub listener port):
@@ -113,3 +136,36 @@ cargo test --locked
 
 Network tests require IPv4 and IPv6 loopback. [Example configs](../examples/) list policy settings;
 [systemd units](../packaging/) supply service installation paths.
+
+
+## Ingress overload protection
+
+Admission control runs before TLS/frame authentication and is shared across hub listeners. Defaults are:
+
+| Resource | Limit |
+| --- | --- |
+| TCP admissions | 128/s globally, 32/s per IP |
+| Active TCP connections | `max_connections = 64` globally, 16 per IP, 4 per authenticated agent |
+| UDP packets admitted to authentication | 50,000/s globally, 2,000/s per IP |
+| Authenticated requests/packets | 4,096/s per agent across TCP/UDP |
+| IP tracking | 4,096 records; inactive records expire after 120 seconds |
+| UDP assemblies | `max_assemblies = 256` globally, 8 per agent; expire after 120 seconds |
+
+Rate buckets start full and allow a burst of twice the configured per-second rate. Excess traffic is dropped/closed;
+there is no waiting queue for admission. A full IP table rejects new IPs until records expire. IPv4-mapped IPv6 shares
+its IPv4 quota. TCP retains its ten-second deadline including TLS. Frame size limits, credential verification and
+per-agent cycle byte quotas also remain active. The bounded intake queue rejects excess events; delivery acknowledgements
+have a bounded wait. A dropped receipt causes a failed attempt/retry, never a false success.
+
+Tune `[ingress]` using the commented defaults in `examples/hub.toml`. Fields must be positive; invalid limits fail
+configuration validation. Limits apply to the socket peer: agents behind NAT share a quota, and a reverse proxy's
+connections share its IP quota. Increase per-IP limits for expected aggregate traffic. Forwarded HTTP headers cannot
+change the quota identity. Registered agent quotas remain independent after authentication.
+
+Rejections are counted by reason and logged at most once every 30 seconds, without peer addresses or request contents.
+Counters cover rate/capacity, authentication/frame errors, agent quotas, assembly limits, oversize UDP, queue pressure
+and timeouts. These are interval counts in the hub log, not persisted status statistics; restart clears them.
+
+This bounds application work and memory. It cannot prevent link saturation or guarantee availability under distributed
+traffic; network/provider filtering is still needed for volumetric attacks. Limits may cause failed monitoring cycles
+under load, which is preferable to reporting delivery that did not complete.

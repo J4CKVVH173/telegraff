@@ -1,8 +1,10 @@
 mode = "hub"
 database = "/var/lib/telegraff/state.sqlite"
 target = "hub.example.net"
-# Set to 443 when nginx serves HTTPS and UDP is separately forwarded on 443.
+# Public TCP endpoint; UDP uses this port unless public_udp_port is set.
 # public_port = 443
+# public_udp_port = 9477
+# udp_target = "origin.example.net" # only if direct UDP uses another host
 tcp_listen = ["127.0.0.1:9477", "[::1]:9477"]
 udp_listen = ["127.0.0.1:9477", "[::1]:9477"]
 retention_days = 30
@@ -20,3 +22,16 @@ endpoint = "https://ntfy.example.net/telegraff"
 # Paths default to /etc/letsencrypt/live/<target>/. Uncomment [tls] alone to enable.
 # certificate_file = "/etc/letsencrypt/live/hub.example.net/fullchain.pem"
 # private_key_file = "/etc/letsencrypt/live/hub.example.net/privkey.pem"
+
+# Optional admission limits (these are the defaults). Rate buckets allow a burst
+# of twice the per-second rate. Increase per-IP limits for a busy shared proxy/NAT.
+# [ingress]
+# tcp_per_second = 128
+# tcp_per_ip_per_second = 32
+# tcp_connections_per_ip = 16
+# udp_per_second = 50000
+# udp_per_ip_per_second = 2000
+# tracked_ips = 4096
+# agent_tcp_connections = 4
+# agent_assemblies = 8
+# agent_packets_per_second = 4096

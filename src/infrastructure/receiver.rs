@@ -1,5 +1,6 @@
 use super::{
     config::{AgentEntry, read_key},
+    ingress::{Bucket, Guard, Limits, Rejection},
     wire::{DATA, Frame, MAX_FRAME, PART},
 };
 use crate::{
@@ -39,9 +40,15 @@ pub struct Credential {
     pub entry: AgentEntry,
     pub key: Vec<u8>,
     quota: Arc<Mutex<(u64, usize)>>,
+    packets: Arc<Mutex<Bucket>>,
+    connections: Arc<Semaphore>,
+    assemblies: Arc<Semaphore>,
 }
 pub type Registry = Arc<HashMap<String, Credential>>;
 pub fn registry(entries: &[AgentEntry]) -> Result<Registry> {
+    registry_with_limits(entries, &Limits::default())
+}
+pub fn registry_with_limits(entries: &[AgentEntry], limits: &Limits) -> Result<Registry> {
     Ok(Arc::new(
         entries
             .iter()
@@ -52,6 +59,12 @@ pub fn registry(entries: &[AgentEntry]) -> Result<Registry> {
                         entry: e.clone(),
                         key: read_key(&e.key_file)?,
                         quota: Arc::new(Mutex::new((0, 0))),
+                        packets: Arc::new(Mutex::new(Bucket::new(
+                            limits.agent_packets_per_second,
+                            Instant::now(),
+                        ))),
+                        connections: Arc::new(Semaphore::new(limits.agent_tcp_connections)),
+                        assemblies: Arc::new(Semaphore::new(limits.agent_assemblies)),
                     },
                 ))
             })
@@ -140,6 +153,10 @@ fn authenticate(
                 || credential.entry.policy().accepts(frame.cycle, unix_time())),
         "Invalid cycle or total"
     );
+    ensure!(
+        credential.packets.lock().unwrap().take(Instant::now()),
+        AgentLimit
+    );
     {
         let mut quota = credential
             .quota
@@ -150,15 +167,38 @@ fn authenticate(
             *quota = (quota_cycle, 0);
         }
         quota.1 = quota.1.saturating_add(bytes.len());
-        ensure!(
-            quota.1 <= credential.entry.payload_bytes * 48,
-            "Agent rate limit reached"
-        );
+        ensure!(quota.1 <= credential.entry.payload_bytes * 48, AgentLimit);
     }
     Ok((frame, credential.clone()))
 }
+#[derive(Debug)]
+struct AgentLimit;
+impl std::fmt::Display for AgentLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Agent resource quota reached")
+    }
+}
+impl std::error::Error for AgentLimit {}
+#[derive(Debug)]
+struct QueueFull;
+impl std::fmt::Display for QueueFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Intake queue unavailable")
+    }
+}
+impl std::error::Error for QueueFull {}
+fn rejected(guard: &Guard, error: &anyhow::Error) {
+    guard.reject(if error.is::<AgentLimit>() {
+        Rejection::AgentQuota
+    } else if error.is::<QueueFull>() {
+        Rejection::Queue
+    } else {
+        Rejection::Authentication
+    });
+}
 async fn submit(
     tx: &mpsc::Sender<Intake>,
+    guard: &Guard,
     frame: &Frame,
     bytes: usize,
     elapsed: Duration,
@@ -177,16 +217,22 @@ async fn submit(
         fingerprint,
     };
     if tx
-        .send(Intake {
+        .try_send(Intake {
             event: Incoming::Transfer(result_data),
             accepted,
         })
-        .await
         .is_err()
     {
+        guard.reject(Rejection::Queue);
         return false;
     }
-    result.await.unwrap_or_default().accepted
+    match timeout(Duration::from_secs(1), result).await {
+        Ok(Ok(reply)) => reply.accepted,
+        _ => {
+            guard.reject(Rejection::Queue);
+            false
+        }
+    }
 }
 pub async fn tcp_loop(
     listener: TcpListener,
@@ -205,16 +251,40 @@ pub async fn tcp_loop_with_tls(
     permits: Arc<Semaphore>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
+    tcp_loop_guarded(
+        listener,
+        registry,
+        tx,
+        permits,
+        tls,
+        Guard::new(Limits::default(), 256),
+    )
+    .await
+}
+pub async fn tcp_loop_guarded(
+    listener: TcpListener,
+    registry: Registry,
+    tx: mpsc::Sender<Intake>,
+    permits: Arc<Semaphore>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    guard: Arc<Guard>,
+) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        let Some(connection) = guard.tcp(peer.ip()) else {
+            continue;
+        };
         let Ok(permit) = permits.clone().try_acquire_owned() else {
+            guard.reject(Rejection::Connections);
             continue;
         };
         let registry = registry.clone();
         let tx = tx.clone();
         let tls = tls.clone();
+        let guard = guard.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _connection = connection;
             let result = timeout(Duration::from_secs(10), async {
                 let start = Instant::now();
                 // Handshake shares the bounded request deadline and connection permit.
@@ -225,6 +295,11 @@ pub async fn tcp_loop_with_tls(
                 };
                 let (bytes, http) = super::http::read_request(&mut stream).await?;
                 let (frame, c) = authenticate(&bytes, &registry, peer, Protocol::Tcp, http)?;
+                let _agent_connection = c
+                    .connections
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| anyhow::anyhow!(AgentLimit))?;
                 if frame.kind == super::wire::IDENTITY {
                     ensure!(frame.payload.len() <= 512, "Invalid identity report");
                     let observation: crate::application::ports::DnsObservation =
@@ -237,11 +312,11 @@ pub async fn tcp_loop_with_tls(
                         "Invalid DNS observation"
                     );
                     let (accepted, response) = oneshot::channel();
-                    tx.send(Intake {
+                    tx.try_send(Intake {
                         event: Incoming::Dns(frame.agent.clone(), observation),
                         accepted,
                     })
-                    .await?;
+                    .map_err(|_| anyhow::anyhow!(QueueFull))?;
                     let reply = response.await?;
                     if reply.accepted {
                         let mut receipt = frame.receipt(0);
@@ -263,6 +338,7 @@ pub async fn tcp_loop_with_tls(
                 );
                 if submit(
                     &tx,
+                    &guard,
                     &frame,
                     frame.payload.len(),
                     start.elapsed(),
@@ -281,14 +357,10 @@ pub async fn tcp_loop_with_tls(
                 Ok::<_, anyhow::Error>(())
             })
             .await;
-            if crate::utils::verbose() {
-                match result {
-                    Ok(Err(error)) => {
-                        crate::utils::log(&format!("TCP request rejected: {error:#}"), 31)
-                    }
-                    Err(_) => crate::utils::log("TCP request timed out (10s)", 31),
-                    _ => {}
-                }
+            match result {
+                Ok(Err(error)) => rejected(&guard, &error),
+                Err(_) => guard.reject(Rejection::Timeout),
+                _ => {}
             }
         });
     }
@@ -300,6 +372,10 @@ pub struct Assembly {
     hashes: BTreeMap<u16, [u8; 32]>,
     pub bytes: usize,
     pub invalid: bool,
+    permits: Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
 }
 impl Assembly {
     pub fn new(frame: &Frame) -> Self {
@@ -312,6 +388,7 @@ impl Assembly {
             hashes: BTreeMap::new(),
             bytes: 0,
             invalid: false,
+            permits: None,
         }
     }
     pub fn fingerprint(&self) -> String {
@@ -358,35 +435,60 @@ pub async fn udp_loop(
     tx: mpsc::Sender<Intake>,
     max_assemblies: usize,
 ) -> Result<()> {
+    udp_loop_guarded(
+        socket,
+        registry,
+        tx,
+        max_assemblies,
+        Guard::new(Limits::default(), max_assemblies),
+    )
+    .await
+}
+pub async fn udp_loop_guarded(
+    socket: UdpSocket,
+    registry: Registry,
+    tx: mpsc::Sender<Intake>,
+    max_assemblies: usize,
+    guard: Arc<Guard>,
+) -> Result<()> {
     let mut assemblies: HashMap<(String, u64, Family, u8), Assembly> = HashMap::new();
     let mut buffer = [0; 1233];
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
     let mut quota: HashMap<String, (u64, usize)> = HashMap::new();
-    let mut packet_window = (Instant::now(), 0usize);
+
     loop {
         tokio::select! {
             incoming = socket.recv_from(&mut buffer) => {
                 let (n,peer) = incoming?;
-                if packet_window.0.elapsed() >= Duration::from_secs(1) { packet_window = (Instant::now(),0); }
-                packet_window.1 += 1;
-                if n > 1232 || packet_window.1 > 50000 { continue; }
-                let Ok((frame,c)) = authenticate(&buffer[..n],&registry,peer,Protocol::Udp,false) else { continue; };
+                if !guard.udp(peer.ip()) { continue; }
+                if n > 1232 { guard.reject(Rejection::Oversize); continue; }
+                let (frame,c) = match authenticate(&buffer[..n],&registry,peer,Protocol::Udp,false) {
+                    Ok(result) => result,
+                    Err(error) => { rejected(&guard, &error); continue; }
+                };
                 let quota_cycle = unix_time() / c.entry.interval;
                 let q = quota.entry(frame.agent.clone()).or_insert((quota_cycle,0));
                 if q.0 != quota_cycle { *q = (quota_cycle,0); }
                 q.1 += n;
-                if q.1 > c.entry.payload_bytes * 24 { continue; }
+                if q.1 > c.entry.payload_bytes * 24 { guard.reject(Rejection::AgentQuota); continue; }
                 let id = (frame.agent.clone(),frame.cycle,frame.channel.family,frame.transfer);
-                if !assemblies.contains_key(&id) && assemblies.len() >= max_assemblies { continue; }
-                let a = assemblies.entry(id).or_insert_with(|| Assembly::new(&frame));
-                if a.expired() || a.add(&frame).is_err() { continue; }
+                if !assemblies.contains_key(&id) {
+                    if assemblies.len() >= max_assemblies { guard.reject(Rejection::Assemblies); continue; }
+                    let Ok(global) = guard.assemblies.clone().try_acquire_owned() else { guard.reject(Rejection::Assemblies); continue; };
+                    let Ok(agent) = c.assemblies.clone().try_acquire_owned() else { guard.reject(Rejection::AgentQuota); continue; };
+                    let mut assembly = Assembly::new(&frame);
+                    assembly.permits = Some((global, agent));
+                    assemblies.insert(id.clone(), assembly);
+                }
+                let a = assemblies.get_mut(&id).unwrap();
+                if a.expired() || a.add(&frame).is_err() { guard.reject(Rejection::Authentication); continue; }
                 if a.invalid {
-                    let _=submit(&tx,&frame,a.bytes,a.started.elapsed(),true,a.fingerprint()).await;
+                    let _=submit(&tx,&guard,&frame,a.bytes,a.started.elapsed(),true,a.fingerprint()).await;
                     continue;
                 }
                 let passes = a.bytes * 100 >= c.entry.payload_bytes * usize::from(c.entry.udp_threshold);
                 if passes || frame.part + 1 == frame.parts {
-                    let accepted = submit(&tx,&frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await;
+                    let accepted = submit(&tx,&guard,&frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await;
                     // Each valid new part can update intake, but only the last part solicits a receipt.
                     if accepted && frame.part + 1 == frame.parts {
                         let reply = frame.receipt(a.bytes).encode(&c.key);
@@ -398,9 +500,167 @@ pub async fn udp_loop(
                 let now = unix_time();
                 let expired: Vec<_> = assemblies.iter().filter(|(_,a)| a.expired() || registry.get(&a.frame.agent).is_none_or(|c| c.entry.paused || (c.entry.grace != c.entry.interval && !c.entry.policy().accepts(a.frame.cycle,now)))).map(|(k,_)| k.clone()).collect();
                 for id in expired {
-                    if let Some(a) = assemblies.remove(&id) && !a.invalid { let _ = submit(&tx,&a.frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await; }
+                    if let Some(a) = assemblies.remove(&id) && !a.invalid { let _ = submit(&tx,&guard,&a.frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await; }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    fn entry(dir: &std::path::Path, name: &str) -> AgentEntry {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("{name}.key"));
+        std::fs::write(&path, hex::encode([7; 32])).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        AgentEntry {
+            name: name.into(),
+            key_file: path,
+            activation: 0,
+            interval: 3600,
+            offset: 0,
+            grace: 3600,
+            paused: false,
+            families: vec![Family::Ipv4],
+            auto: false,
+            payload_bytes: 153600,
+            udp_threshold: 99,
+        }
+    }
+    fn frame(name: &str, protocol: Protocol) -> Frame {
+        Frame {
+            kind: DATA,
+            agent: name.into(),
+            cycle: unix_time(),
+            channel: crate::application::Channel {
+                family: Family::Ipv4,
+                protocol,
+            },
+            transfer: 0,
+            total: 153600,
+            part: 0,
+            parts: 153600usize.div_ceil(PART) as u16,
+            payload: vec![0; PART],
+        }
+    }
+    async fn until(mut predicate: impl FnMut() -> bool) {
+        timeout(Duration::from_secs(2), async {
+            while !predicate() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn assembly_limits_span_listeners_and_release_when_listener_stops() {
+        for (global, per_agent, reason) in [(1, 8, "assemblies"), (8, 1, "agent_quota")] {
+            let dir = tempfile::tempdir().unwrap();
+            let limits = Limits {
+                agent_assemblies: per_agent,
+                ..Limits::default()
+            };
+            let registry = registry_with_limits(&[entry(dir.path(), "node")], &limits).unwrap();
+            let guard = Guard::new(limits, global);
+            let (tx, _rx) = mpsc::channel(8);
+            let a = bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address_a = a.local_addr().unwrap();
+            let b = bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address_b = b.local_addr().unwrap();
+            let task_a = tokio::spawn(udp_loop_guarded(
+                a,
+                registry.clone(),
+                tx.clone(),
+                global,
+                guard.clone(),
+            ));
+            let task_b = tokio::spawn(udp_loop_guarded(b, registry, tx, global, guard.clone()));
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut f = frame("node", Protocol::Udp);
+            sender
+                .send_to(&f.encode(&[7; 32]), address_a)
+                .await
+                .unwrap();
+            until(|| guard.assemblies.available_permits() == global - 1).await;
+            f.transfer = 1;
+            sender
+                .send_to(&f.encode(&[7; 32]), address_b)
+                .await
+                .unwrap();
+            let mut rejected = 0;
+            until(|| {
+                for (r, n) in guard.take_rejections() {
+                    assert_eq!(r, reason);
+                    rejected += n;
+                }
+                rejected > 0
+            })
+            .await;
+            task_a.abort();
+            let _ = task_a.await;
+            assert_eq!(guard.assemblies.available_permits(), global);
+            sender
+                .send_to(&f.encode(&[7; 32]), address_b)
+                .await
+                .unwrap();
+            until(|| guard.assemblies.available_permits() == global - 1).await;
+            task_b.abort();
+            let _ = task_b.await;
+            assert_eq!(guard.assemblies.available_permits(), global);
+        }
+    }
+    #[tokio::test]
+    async fn authenticated_tcp_quota_does_not_block_another_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            agent_tcp_connections: 1,
+            ..Limits::default()
+        };
+        let registry = registry_with_limits(
+            &[entry(dir.path(), "first"), entry(dir.path(), "second")],
+            &limits,
+        )
+        .unwrap();
+        let _reserved = registry["first"]
+            .connections
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let guard = Guard::new(limits, 8);
+        let listener = bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel::<Intake>(8);
+        let intake = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let _ = event.accepted.send(IntakeReply {
+                    accepted: true,
+                    families: Vec::new(),
+                });
+            }
+        });
+        let task = tokio::spawn(tcp_loop_guarded(
+            listener,
+            registry,
+            tx,
+            Arc::new(Semaphore::new(8)),
+            None,
+            guard.clone(),
+        ));
+        for name in ["first", "second"] {
+            let mut f = frame(name, Protocol::Tcp);
+            f.parts = 1;
+            f.payload = vec![0; 153600];
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            write_frame(&mut stream, &f.encode(&[7; 32])).await.unwrap();
+            let result = timeout(Duration::from_secs(2), read_frame(&mut stream))
+                .await
+                .unwrap();
+            assert_eq!(result.is_ok(), name == "second");
+        }
+        assert_eq!(guard.take_rejections(), vec![("agent_quota", 1)]);
+        task.abort();
+        intake.abort();
     }
 }
