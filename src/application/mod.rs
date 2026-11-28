@@ -1,8 +1,10 @@
 pub mod agent;
+pub mod confirmation;
 pub mod delivery;
 mod enrollment;
 mod model;
 mod monitor;
+pub mod notification;
 pub mod ports;
 pub mod status;
 pub use model::*;

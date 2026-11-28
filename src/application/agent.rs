@@ -214,7 +214,10 @@ pub async fn run(
                     transfer,
                     total: policy.payload_bytes,
                 };
-                let attempt = transport.send(*address, request, remaining).await;
+                let attempt = transport
+                    .send(*address, request.clone(), remaining)
+                    .await
+                    .and_then(|confirmation| confirmation.validate(&request));
                 match attempt {
                     Ok(bytes) => {
                         accepted_bytes = bytes;
@@ -227,12 +230,12 @@ pub async fn run(
                     }
                 }
             }
-            let passed = match protocol {
-                Protocol::Tcp => accepted_bytes == policy.payload_bytes,
-                Protocol::Udp => {
-                    accepted_bytes * 100 >= policy.payload_bytes * usize::from(policy.udp_threshold)
-                }
-            };
+            let passed = super::confirmation::passes(
+                protocol,
+                accepted_bytes,
+                policy.payload_bytes,
+                policy.udp_threshold,
+            );
             if received {
                 result.accepted = Some(result.accepted.unwrap_or(false) || passed);
             }

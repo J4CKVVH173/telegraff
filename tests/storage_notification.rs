@@ -175,3 +175,67 @@ fn old_sqlite_history_is_capped_on_open_and_read_without_losing_incidents() {
     );
     assert_eq!(store.load().unwrap().transfers.last().unwrap().cycle, 51);
 }
+
+#[tokio::test]
+async fn ntfy_sends_unicode_and_supported_emoji_tags() {
+    use telegraff::{application::ports::Notifier, infrastructure::config::NtfyConfig};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let notifier = Ntfy::new(&NtfyConfig {
+        endpoint: format!("http://{}/topic", listener.local_addr().unwrap()),
+        token_file: None,
+    })
+    .unwrap();
+    let server = tokio::spawn(async move {
+        for (expected, tag) in [
+            ("📡 node\n🔴 UDP · IPv4: нет успешной передачи.", "warning"),
+            (
+                "📡 node\n🟢 UDP · IPv4: передача восстановлена.",
+                "white_check_mark",
+            ),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8(bytes[..header_end].to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.contains("content-type: text/plain; charset=utf-8"));
+            assert!(headers.contains(&format!("tags: {tag}\r\n")));
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            while bytes.len() < header_end + length {
+                let mut chunk = [0; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            assert_eq!(std::str::from_utf8(&bytes[header_end..]).unwrap(), expected);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    notifier
+        .publish("📡 node\n🔴 UDP · IPv4: нет успешной передачи.")
+        .await
+        .unwrap();
+    notifier
+        .publish("📡 node\n🟢 UDP · IPv4: передача восстановлена.")
+        .await
+        .unwrap();
+    server.await.unwrap();
+}

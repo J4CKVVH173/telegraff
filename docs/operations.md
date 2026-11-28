@@ -97,6 +97,27 @@ Hub downtime in `status -v` uses UTC dates and human durations; it describes mis
 Raw timestamps, DNS signatures and all channel fields remain in `status --json`.
 The hub cannot alert while stopped; monitor its process independently.
 
+## Notification format
+
+All new ntfy messages use the same compact Russian text: agent name, calendar date with an explicit UTC
+zone, then one line per affected TCP/UDP and IPv4/IPv6 channel. 🔴 marks three failed checks,
+🟠 a reminder, and 🟢 recovery. DNS setup and hub monitoring interruptions use the same format.
+A failed transfer is described as a failed check, rather than proof that the whole server is unreachable.
+Incident IDs, raw Unix timestamps, DNS hashes and debug representations stay out of notification text.
+The body is UTF-8; ntfy also receives supported emoji tags (`warning`, `white_check_mark`, `satellite`).
+Already queued messages retain their original text and retry order across upgrades.
+
+## Transport boundaries
+
+TCP (including HTTPS/TLS) and UDP have separate send and receive adapters under
+`src/infrastructure/agent/` and `src/infrastructure/receiver/`. They share the authenticated wire
+codec, admission guards and bounded application intake. UDP fragmentation/reassembly stays in infrastructure.
+`application::confirmation` owns transfer identity validation, accepted-byte limits and success thresholds.
+Both adapters return a typed confirmation; the agent application validates it against its request before
+counting a result. TCP requires the full payload; UDP uses the configured loss threshold.
+The common receiver intake sends a confirmation only after application acceptance and persistence.
+The wire format and existing profiles are unchanged.
+
 ## Troubleshooting and updates
 
 | Symptom | Check |

@@ -197,3 +197,57 @@ async fn udp_flood_is_limited_before_frame_authentication() {
     assert_eq!((auth, limited), (2, 8));
     task.abort();
 }
+
+#[tokio::test]
+async fn neither_socket_entry_point_confirms_rejected_application_intake() {
+    use telegraff::application::ports::{TransferRequest, Transport};
+    use telegraff::application::{Channel, Protocol};
+    let dir = tempfile::tempdir().unwrap();
+    let mut entry = entry(key_file(dir.path()));
+    entry.payload_bytes = 2200;
+    entry.grace = entry.interval;
+    let registry = receiver::registry(&[entry]).unwrap();
+    let listener = receiver::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+    let tcp_address = listener.local_addr().unwrap();
+    let socket = receiver::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+    let udp_address = socket.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel::<Intake>(8);
+    let tcp = tokio::spawn(receiver::tcp_loop(
+        listener,
+        registry.clone(),
+        tx.clone(),
+        Arc::new(Semaphore::new(8)),
+    ));
+    let udp = tokio::spawn(receiver::udp_loop(socket, registry, tx, 8));
+    let intake = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let _ = event.accepted.send(receiver::IntakeReply::default());
+        }
+    });
+    let mut transport = SocketTransport::new(vec![7; 32], 1048576);
+    for (protocol, address) in [(Protocol::Tcp, tcp_address), (Protocol::Udp, udp_address)] {
+        let result = transport
+            .send(
+                address,
+                TransferRequest {
+                    agent: "node-01".into(),
+                    cycle: 1,
+                    channel: Channel {
+                        family: Family::Ipv4,
+                        protocol,
+                    },
+                    transfer: 0,
+                    total: 2200,
+                },
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "Rejected {protocol:?} intake received a confirmation"
+        );
+    }
+    tcp.abort();
+    udp.abort();
+    intake.abort();
+}

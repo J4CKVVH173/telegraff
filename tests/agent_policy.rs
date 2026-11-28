@@ -29,6 +29,7 @@ struct Sender {
     calls: Vec<(SocketAddr, Protocol)>,
     fail: Option<Family>,
     missing_receipts: bool,
+    wrong_confirmation: bool,
 }
 #[async_trait]
 impl Transport for Sender {
@@ -37,7 +38,7 @@ impl Transport for Sender {
         address: SocketAddr,
         request: TransferRequest,
         _: Duration,
-    ) -> Result<usize> {
+    ) -> Result<telegraff::application::confirmation::Confirmation> {
         self.calls.push((address, request.channel.protocol));
         if self.missing_receipts
             || Some(request.channel.family) == self.fail
@@ -45,7 +46,13 @@ impl Transport for Sender {
         {
             anyhow::bail!("No receipt");
         }
-        Ok(request.total)
+        Ok(telegraff::application::confirmation::Confirmation {
+            agent: request.agent,
+            cycle: request.cycle + u64::from(self.wrong_confirmation),
+            channel: request.channel,
+            transfer: request.transfer,
+            bytes: request.total,
+        })
     }
 }
 fn settings() -> AgentSettings {
@@ -261,6 +268,34 @@ async fn independent_udp_host_port_and_dns_failure() {
         assert!(
             udp.iter()
                 .all(|(a, _)| *a == "192.0.2.2:9477".parse().unwrap())
+        );
+    }
+}
+
+#[tokio::test]
+async fn application_rejects_unrelated_confirmations_on_tcp_and_udp() {
+    let mut sender = Sender {
+        wrong_confirmation: true,
+        ..Sender::default()
+    };
+    let report = agent::run(
+        &settings(),
+        &answers(&["127.0.0.1", "::1"]),
+        &mut sender,
+        &FixedClock,
+    )
+    .await
+    .unwrap();
+    assert!(!report.successful());
+    assert_eq!(report.channels.len(), 4);
+    for channel in report.channels {
+        assert!(channel.accepted.is_none());
+        assert!(!channel.receipt_received);
+        assert!(
+            channel
+                .transfers
+                .iter()
+                .all(|t| t.error.as_deref() == Some("Confirmation does not match transfer"))
         );
     }
 }

@@ -98,12 +98,12 @@ impl Transfer {
         if self.invalid {
             return false;
         }
-        match self.channel.protocol {
-            Protocol::Tcp => self.bytes == policy.payload_bytes,
-            Protocol::Udp => {
-                self.bytes * 100 >= policy.payload_bytes * usize::from(policy.udp_threshold)
-            }
-        }
+        super::confirmation::passes(
+            self.channel.protocol,
+            self.bytes,
+            policy.payload_bytes,
+            policy.udp_threshold,
+        )
     }
 }
 

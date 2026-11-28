@@ -40,6 +40,7 @@ pub trait Notifier {
     async fn publish(&self, text: &str) -> Result<()>;
 }
 
+#[derive(Debug, Clone)]
 pub struct TransferRequest {
     pub agent: String,
     pub cycle: u64,
@@ -58,7 +59,7 @@ pub trait Transport: Send {
         address: std::net::SocketAddr,
         request: TransferRequest,
         budget: std::time::Duration,
-    ) -> Result<usize>;
+    ) -> Result<super::confirmation::Confirmation>;
 }
 
 pub struct IdentityRequest {

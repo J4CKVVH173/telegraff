@@ -146,6 +146,32 @@ impl Frame {
             ..self.clone()
         }
     }
+    pub fn into_confirmation(self) -> Result<crate::application::confirmation::Confirmation> {
+        ensure!(
+            self.kind == RECEIPT && self.part == 0 && self.parts == 0 && self.payload.is_empty(),
+            "Invalid transfer confirmation envelope"
+        );
+        Ok(crate::application::confirmation::Confirmation {
+            agent: self.agent,
+            cycle: self.cycle,
+            channel: self.channel,
+            transfer: self.transfer,
+            bytes: self.total as usize,
+        })
+    }
+    pub fn from_confirmation(c: crate::application::confirmation::Confirmation) -> Self {
+        Self {
+            kind: RECEIPT,
+            agent: c.agent,
+            cycle: c.cycle,
+            channel: c.channel,
+            transfer: c.transfer,
+            total: c.bytes as u32,
+            part: 0,
+            parts: 0,
+            payload: Vec::new(),
+        }
+    }
     pub fn matches_receipt(&self, receipt: &Self) -> bool {
         receipt.kind == RECEIPT
             && receipt.agent == self.agent

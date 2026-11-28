@@ -1,3 +1,8 @@
+mod tcp;
+mod udp;
+use tcp::Https;
+use udp::udp;
+
 use super::{
     receiver::{read_frame, write_frame},
     wire::{DATA, Frame, PART},
@@ -65,67 +70,6 @@ impl SocketTransport {
         }
         Ok(transport)
     }
-    async fn exchange(&self, address: SocketAddr, frame: &Frame) -> Result<Vec<u8>> {
-        if let Some(https) = &self.https {
-            https.exchange(address, &frame.encode(&self.key)).await
-        } else {
-            let mut socket = TcpStream::connect(address).await?;
-            write_frame(&mut socket, &frame.encode(&self.key)).await?;
-            read_frame(&mut socket).await
-        }
-    }
-}
-struct Https {
-    host: String,
-    certificates: Vec<reqwest::Certificate>,
-}
-impl Https {
-    async fn exchange(&self, address: SocketAddr, bytes: &[u8]) -> Result<Vec<u8>> {
-        let mut url = reqwest::Url::parse("https://localhost/telegraff")?;
-        url.set_host(Some(&self.host))
-            .context("Invalid hub hostname")?;
-        url.set_port(Some(address.port()))
-            .map_err(|_| anyhow::anyhow!("Invalid HTTPS port"))?;
-        // Pin the exact family/address selected by the monitoring application;
-        // retain the DNS hostname in the URL for Host, SNI and certificate checks.
-        let mut builder = reqwest::Client::builder()
-            .use_rustls_tls()
-            .http1_only()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&self.host, &[address])
-            .timeout(Duration::from_secs(10));
-        for certificate in &self.certificates {
-            builder = builder.add_root_certificate(certificate.clone());
-        }
-        let mut response = builder
-            .build()?
-            .post(url)
-            .header("Content-Type", "application/octet-stream")
-            .body(bytes.to_vec())
-            .send()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "HTTPS connection or certificate verification failed: {}",
-                    error_chain(&e)
-                )
-            })?;
-        ensure!(
-            response.status() == reqwest::StatusCode::OK,
-            "Unexpected HTTPS status: {}",
-            response.status()
-        );
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                body.len() + chunk.len() <= super::wire::MAX_FRAME,
-                "HTTPS receipt too large"
-            );
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
-    }
 }
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut messages = vec![error.to_string()];
@@ -191,7 +135,7 @@ impl Transport for SocketTransport {
         address: SocketAddr,
         request: TransferRequest,
         budget: Duration,
-    ) -> Result<usize> {
+    ) -> Result<crate::application::confirmation::Confirmation> {
         let mut frame = Frame {
             kind: DATA,
             agent: request.agent,
@@ -219,11 +163,8 @@ impl Transport for SocketTransport {
         };
         timeout(budget.min(Duration::from_secs(cap)), async {
             match frame.channel.protocol {
-                Protocol::Tcp => {
-                    let receipt = Frame::decode(&self.exchange(address, &frame).await?, &self.key)?;
-                    ensure!(frame.matches_receipt(&receipt), "Invalid TCP receipt");
-                    Ok(receipt.total as usize)
-                }
+                Protocol::Tcp => Frame::decode(&self.exchange(address, &frame).await?, &self.key)?
+                    .into_confirmation(),
                 Protocol::Udp => {
                     udp(address, &frame, &self.key, self.rate, &mut self.next_send).await
                 }
@@ -232,36 +173,4 @@ impl Transport for SocketTransport {
         .await
         .map_err(|_| anyhow::anyhow!("Transfer timed out"))?
     }
-}
-async fn udp(
-    address: SocketAddr,
-    template: &Frame,
-    key: &[u8],
-    rate: u64,
-    next: &mut Instant,
-) -> Result<usize> {
-    let socket = UdpSocket::bind(if address.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .await?;
-    socket.connect(address).await?;
-    let parts = template.payload.len().div_ceil(PART) as u16;
-    for (part, payload) in template.payload.chunks(PART).enumerate() {
-        sleep_until(*next).await;
-        let frame = Frame {
-            part: part as u16,
-            parts,
-            payload: payload.to_vec(),
-            ..template.clone()
-        };
-        socket.send(&frame.encode(key)).await?;
-        *next = Instant::now() + Duration::from_secs_f64(payload.len() as f64 / rate as f64);
-    }
-    let mut bytes = [0; 1232];
-    let n = timeout(Duration::from_secs(1), socket.recv(&mut bytes)).await??;
-    let receipt = Frame::decode(&bytes[..n], key)?;
-    ensure!(template.matches_receipt(&receipt), "Invalid UDP receipt");
-    Ok(receipt.total as usize)
 }

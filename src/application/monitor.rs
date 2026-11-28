@@ -105,7 +105,10 @@ impl Monitor {
         let previous = self.state.observed_until;
         if previous > 0 && now > previous + 5 {
             self.state.gaps.push((previous, now));
-            self.state.enqueue("hub", now, format!("Hub recovered at {now}. Observation gap: {previous}..{now}. Server state during this gap is unknown."));
+            self.state.enqueue("hub", now, super::notification::message("Хаб", now, &[
+                format!("🟢 Мониторинг возобновлён.\nПерерыв: {} — {} ({}).\nСостояние серверов за это время неизвестно.",
+                    crate::utils::timestamp(previous), crate::utils::timestamp(now), crate::utils::duration(now - previous))
+            ]));
         }
         for p in &self.policies {
             if p.families.is_empty()
@@ -201,15 +204,17 @@ impl Monitor {
                     if ok {
                         s.last_success = Some(cycle);
                         s.failures = 0;
-                        if let Some(id) = s.incident.take() {
-                            messages
-                                .push(format!("{label} recovered; incident={id}; cycle={cycle}"));
+                        if s.incident.take().is_some() {
+                            messages.push(format!(
+                                "🟢 {}: передача восстановлена.",
+                                super::notification::channel(channel)
+                            ));
                         }
                     } else {
                         s.failures = s.failures.saturating_add(1);
                         if s.failures == 3 {
                             let id = format!("{}-{label}-{cycle}", p.name);
-                            messages.push(format!("{label} failed for 3 consecutive cycles; last_success={:?}; incident={id}", s.last_success));
+                            messages.push(super::notification::failure(channel, s.last_success));
                             s.incident = Some(id);
                             s.last_reminder = now;
                         }
@@ -222,9 +227,9 @@ impl Monitor {
                     && now.saturating_sub(s.last_reminder) >= self.reminder
                 {
                     messages.push(format!(
-                        "{label} still failing; failures={}; incident={}",
-                        s.failures,
-                        s.incident.as_deref().unwrap_or_default()
+                        "🟠 {}: сбой сохраняется, {} проверок подряд.",
+                        super::notification::channel(channel),
+                        s.failures
                     ));
                     s.last_reminder = now;
                 }
@@ -233,7 +238,7 @@ impl Monitor {
                 self.state.enqueue(
                     &p.name,
                     now,
-                    format!("{} at {now}: {}", p.name, messages.join("; ")),
+                    super::notification::message(&p.name, now, &messages),
                 );
             }
         }

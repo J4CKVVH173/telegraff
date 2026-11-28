@@ -30,6 +30,17 @@ impl Notifier for Ntfy {
         }
         let result = request
             .header("Title", "telegraff")
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header(
+                "Tags",
+                if text.contains('🔴') || text.contains('🟠') {
+                    "warning"
+                } else if text.contains('🟢') {
+                    "white_check_mark"
+                } else {
+                    "satellite"
+                },
+            )
             .body(text.to_owned())
             .send()
             .await

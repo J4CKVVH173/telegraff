@@ -54,7 +54,7 @@ impl Monitor {
                     self.state.enqueue(
                         &policy.name,
                         now,
-                        format!("{}: DNS enrollment recovered at {now}", policy.name),
+                        super::notification::message(&policy.name, now, &["🟢 DNS: настройка мониторинга завершена. Проверки TCP и UDP включены.".into()]),
                     );
                 }
             }
@@ -80,10 +80,7 @@ impl Monitor {
                         self.state.enqueue(
                             &policy.name,
                             now,
-                            format!(
-                                "{}: DNS enrollment failed for 3 consecutive cycles at {now}",
-                                policy.name
-                            ),
+                            super::notification::message(&policy.name, now, &["🔴 DNS: не удалось начать мониторинг 3 проверки подряд.\nПроверьте DNS-имя и доступность резолвера на хабе.".into()]),
                         );
                     }
                 }

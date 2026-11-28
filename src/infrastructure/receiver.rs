@@ -1,3 +1,8 @@
+mod tcp;
+mod udp;
+pub use tcp::{tcp_loop, tcp_loop_guarded, tcp_loop_with_tls};
+pub use udp::{udp_loop, udp_loop_guarded};
+
 use super::{
     config::{AgentEntry, read_key},
     ingress::{Bucket, Guard, Limits, Rejection},
@@ -204,7 +209,7 @@ async fn submit(
     elapsed: Duration,
     invalid: bool,
     fingerprint: String,
-) -> bool {
+) -> Option<crate::application::confirmation::Confirmation> {
     let (accepted, result) = oneshot::channel();
     let result_data = Transfer {
         agent: frame.agent.clone(),
@@ -216,6 +221,7 @@ async fn submit(
         invalid,
         fingerprint,
     };
+    let confirmation = crate::application::confirmation::Confirmation::accepted(&result_data);
     if tx
         .try_send(Intake {
             event: Incoming::Transfer(result_data),
@@ -224,148 +230,16 @@ async fn submit(
         .is_err()
     {
         guard.reject(Rejection::Queue);
-        return false;
+        return None;
     }
     match timeout(Duration::from_secs(1), result).await {
-        Ok(Ok(reply)) => reply.accepted,
+        Ok(Ok(reply)) => reply.accepted.then_some(confirmation),
         _ => {
             guard.reject(Rejection::Queue);
-            false
+            None
         }
     }
 }
-pub async fn tcp_loop(
-    listener: TcpListener,
-    registry: Registry,
-    tx: mpsc::Sender<Intake>,
-    permits: Arc<Semaphore>,
-) -> Result<()> {
-    tcp_loop_with_tls(listener, registry, tx, permits, None).await
-}
-trait Connection: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Connection for T {}
-pub async fn tcp_loop_with_tls(
-    listener: TcpListener,
-    registry: Registry,
-    tx: mpsc::Sender<Intake>,
-    permits: Arc<Semaphore>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-) -> Result<()> {
-    tcp_loop_guarded(
-        listener,
-        registry,
-        tx,
-        permits,
-        tls,
-        Guard::new(Limits::default(), 256),
-    )
-    .await
-}
-pub async fn tcp_loop_guarded(
-    listener: TcpListener,
-    registry: Registry,
-    tx: mpsc::Sender<Intake>,
-    permits: Arc<Semaphore>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-    guard: Arc<Guard>,
-) -> Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let Some(connection) = guard.tcp(peer.ip()) else {
-            continue;
-        };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            guard.reject(Rejection::Connections);
-            continue;
-        };
-        let registry = registry.clone();
-        let tx = tx.clone();
-        let tls = tls.clone();
-        let guard = guard.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _connection = connection;
-            let result = timeout(Duration::from_secs(10), async {
-                let start = Instant::now();
-                // Handshake shares the bounded request deadline and connection permit.
-                let mut stream: Box<dyn Connection> = if let Some(tls) = tls {
-                    Box::new(tls.accept(stream).await?)
-                } else {
-                    Box::new(stream)
-                };
-                let (bytes, http) = super::http::read_request(&mut stream).await?;
-                let (frame, c) = authenticate(&bytes, &registry, peer, Protocol::Tcp, http)?;
-                let _agent_connection = c
-                    .connections
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| anyhow::anyhow!(AgentLimit))?;
-                if frame.kind == super::wire::IDENTITY {
-                    ensure!(frame.payload.len() <= 512, "Invalid identity report");
-                    let observation: crate::application::ports::DnsObservation =
-                        serde_json::from_slice(&frame.payload)?;
-                    ensure!(
-                        observation.signature.len() == 64
-                            && observation.signature.bytes().all(|b| b.is_ascii_hexdigit())
-                            && observation.ipv4_records <= 1024
-                            && observation.ipv6_records <= 1024,
-                        "Invalid DNS observation"
-                    );
-                    let (accepted, response) = oneshot::channel();
-                    tx.try_send(Intake {
-                        event: Incoming::Dns(frame.agent.clone(), observation),
-                        accepted,
-                    })
-                    .map_err(|_| anyhow::anyhow!(QueueFull))?;
-                    let reply = response.await?;
-                    if reply.accepted {
-                        let mut receipt = frame.receipt(0);
-                        receipt.payload = reply
-                            .families
-                            .iter()
-                            .map(|f| if *f == Family::Ipv4 { 4 } else { 6 })
-                            .collect();
-                        super::http::write_response(&mut stream, &receipt.encode(&c.key), http)
-                            .await?;
-                    }
-                    return Ok::<_, anyhow::Error>(());
-                }
-                ensure!(
-                    frame.part == 0
-                        && frame.parts == 1
-                        && frame.payload.len() == c.entry.payload_bytes,
-                    "Incomplete TCP transfer"
-                );
-                if submit(
-                    &tx,
-                    &guard,
-                    &frame,
-                    frame.payload.len(),
-                    start.elapsed(),
-                    false,
-                    hex::encode(Sha256::digest(&frame.payload)),
-                )
-                .await
-                {
-                    super::http::write_response(
-                        &mut stream,
-                        &frame.receipt(frame.payload.len()).encode(&c.key),
-                        http,
-                    )
-                    .await?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-            match result {
-                Ok(Err(error)) => rejected(&guard, &error),
-                Err(_) => guard.reject(Rejection::Timeout),
-                _ => {}
-            }
-        });
-    }
-}
-
 pub struct Assembly {
     pub frame: Frame,
     pub started: Instant,
@@ -426,84 +300,6 @@ impl Assembly {
         self.hashes.insert(f.part, hash);
         self.bytes += f.payload.len();
         Ok(true)
-    }
-}
-
-pub async fn udp_loop(
-    socket: UdpSocket,
-    registry: Registry,
-    tx: mpsc::Sender<Intake>,
-    max_assemblies: usize,
-) -> Result<()> {
-    udp_loop_guarded(
-        socket,
-        registry,
-        tx,
-        max_assemblies,
-        Guard::new(Limits::default(), max_assemblies),
-    )
-    .await
-}
-pub async fn udp_loop_guarded(
-    socket: UdpSocket,
-    registry: Registry,
-    tx: mpsc::Sender<Intake>,
-    max_assemblies: usize,
-    guard: Arc<Guard>,
-) -> Result<()> {
-    let mut assemblies: HashMap<(String, u64, Family, u8), Assembly> = HashMap::new();
-    let mut buffer = [0; 1233];
-    let mut cleanup = tokio::time::interval(Duration::from_secs(1));
-    let mut quota: HashMap<String, (u64, usize)> = HashMap::new();
-
-    loop {
-        tokio::select! {
-            incoming = socket.recv_from(&mut buffer) => {
-                let (n,peer) = incoming?;
-                if !guard.udp(peer.ip()) { continue; }
-                if n > 1232 { guard.reject(Rejection::Oversize); continue; }
-                let (frame,c) = match authenticate(&buffer[..n],&registry,peer,Protocol::Udp,false) {
-                    Ok(result) => result,
-                    Err(error) => { rejected(&guard, &error); continue; }
-                };
-                let quota_cycle = unix_time() / c.entry.interval;
-                let q = quota.entry(frame.agent.clone()).or_insert((quota_cycle,0));
-                if q.0 != quota_cycle { *q = (quota_cycle,0); }
-                q.1 += n;
-                if q.1 > c.entry.payload_bytes * 24 { guard.reject(Rejection::AgentQuota); continue; }
-                let id = (frame.agent.clone(),frame.cycle,frame.channel.family,frame.transfer);
-                if !assemblies.contains_key(&id) {
-                    if assemblies.len() >= max_assemblies { guard.reject(Rejection::Assemblies); continue; }
-                    let Ok(global) = guard.assemblies.clone().try_acquire_owned() else { guard.reject(Rejection::Assemblies); continue; };
-                    let Ok(agent) = c.assemblies.clone().try_acquire_owned() else { guard.reject(Rejection::AgentQuota); continue; };
-                    let mut assembly = Assembly::new(&frame);
-                    assembly.permits = Some((global, agent));
-                    assemblies.insert(id.clone(), assembly);
-                }
-                let a = assemblies.get_mut(&id).unwrap();
-                if a.expired() || a.add(&frame).is_err() { guard.reject(Rejection::Authentication); continue; }
-                if a.invalid {
-                    let _=submit(&tx,&guard,&frame,a.bytes,a.started.elapsed(),true,a.fingerprint()).await;
-                    continue;
-                }
-                let passes = a.bytes * 100 >= c.entry.payload_bytes * usize::from(c.entry.udp_threshold);
-                if passes || frame.part + 1 == frame.parts {
-                    let accepted = submit(&tx,&guard,&frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await;
-                    // Each valid new part can update intake, but only the last part solicits a receipt.
-                    if accepted && frame.part + 1 == frame.parts {
-                        let reply = frame.receipt(a.bytes).encode(&c.key);
-                        let _ = socket.send_to(&reply,peer).await;
-                    }
-                }
-            }
-            _ = cleanup.tick() => {
-                let now = unix_time();
-                let expired: Vec<_> = assemblies.iter().filter(|(_,a)| a.expired() || registry.get(&a.frame.agent).is_none_or(|c| c.entry.paused || (c.entry.grace != c.entry.interval && !c.entry.policy().accepts(a.frame.cycle,now)))).map(|(k,_)| k.clone()).collect();
-                for id in expired {
-                    if let Some(a) = assemblies.remove(&id) && !a.invalid { let _ = submit(&tx,&guard,&a.frame,a.bytes,a.started.elapsed(),false,a.fingerprint()).await; }
-                }
-            }
-        }
     }
 }
 

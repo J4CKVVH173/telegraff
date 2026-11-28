@@ -193,7 +193,7 @@ async fn check_https(ip: IpAddr) {
     })
     .await
     .unwrap();
-    assert_eq!(result.unwrap(), 153600);
+    assert_eq!(result.unwrap().bytes, 153600);
     for _ in 0..2 {
         assert_eq!(fixture.sni.recv().await.unwrap(), "hub.test");
     }
@@ -251,7 +251,7 @@ async fn explicit_plain_tcp_preserves_legacy_domain_connections() {
     })
     .await
     .unwrap();
-    assert_eq!(result.unwrap(), 153600);
+    assert_eq!(result.unwrap().bytes, 153600);
 }
 #[test]
 fn rejects_invalid_ca_or_host_configuration() {
@@ -409,7 +409,7 @@ async fn check_native_tls(ip: IpAddr) {
     })
     .await
     .unwrap();
-    assert_eq!(result.unwrap(), 153600);
+    assert_eq!(result.unwrap().bytes, 153600);
     task.abort();
     let _ = task.await;
 }
